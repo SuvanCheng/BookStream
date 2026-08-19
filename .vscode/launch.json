@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:BookStream}",
+            "name": "Debug BookStream",
+            "target": "BookStream",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug BookStream"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:BookStream}",
+            "name": "Release BookStream",
+            "target": "BookStream",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release BookStream"
+        }
+    ]
+}

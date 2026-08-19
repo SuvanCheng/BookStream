@@ -1,0 +1,9 @@
+# macOS 构建产物
+.build/
+dist/
+*.swp
+.DS_Store
+
+# books/ 下仅保留示例书，其余（导出/测试产物）忽略
+books/*
+!books/odyssey.txt
