@@ -111,11 +111,12 @@ public final class AudioEngine: @unchecked Sendable {
     // MARK: - 公开 API（书 → TTS 音频 + SRT 时间轴）
 
     public func renderBook(
-        sentences: [String],
+        sentences: [Sentence],
         outputURL: URL,
         voiceIdentifier: String?,
         piperVoice: PiperVoice? = nil,
         rate: Float,
+        pauseScale: Float = 1.0,
         progress: @escaping @Sendable @MainActor (Int, Int) -> Void,
         cancellation: @escaping @Sendable () -> Bool
     ) async throws -> SynthResult {
@@ -129,6 +130,7 @@ public final class AudioEngine: @unchecked Sendable {
                             voiceIdentifier: voiceIdentifier,
                             piperVoice: piperVoice,
                             rate: rate,
+                            pauseScale: pauseScale,
                             progress: progress,
                             cancellation: cancellation
                         )
@@ -181,11 +183,12 @@ public final class AudioEngine: @unchecked Sendable {
     // MARK: - 同步实现（仅在专属音频线程上执行）
 
     private func renderBookSync(
-        sentences: [String],
+        sentences: [Sentence],
         outputURL: URL,
         voiceIdentifier: String?,
         piperVoice: PiperVoice?,
         rate: Float,
+        pauseScale: Float,
         progress: @escaping @Sendable @MainActor (Int, Int) -> Void,
         cancellation: @escaping @Sendable () -> Bool
     ) throws -> SynthResult {
@@ -197,13 +200,14 @@ public final class AudioEngine: @unchecked Sendable {
 
         var segments: [TimedSegment] = []
         var frameCursor: Int64 = 0
+        let silenceChunk = AVAudioFrameCount(AudioFormat.sampleRateInt)
 
         for (i, sentence) in sentences.enumerated() {
             if cancellation() { throw BookStreamError.cancelled }
 
             let startPos = file.framePosition
             let rawBuffers = try renderOne(
-                sentence: sentence,
+                sentence: sentence.text,
                 voice: voice,
                 rate: rate,
                 synthesizer: synth,
@@ -216,13 +220,20 @@ public final class AudioEngine: @unchecked Sendable {
             }
             let frames = file.framePosition - startPos
 
+            // 句后停顿（真人朗读节奏）：计入本片段时长，字幕随停顿停留
+            var pauseFrames: Int64 = 0
+            if pauseScale > 0, sentence.pauseAfter > 0 {
+                pauseFrames = Int64((sentence.pauseAfter * Double(pauseScale) * AudioFormat.sampleRate).rounded())
+                try writeSilence(file, frames: pauseFrames, chunk: silenceChunk)
+            }
+
             segments.append(TimedSegment(
                 id: i,
-                text: sentence,
+                text: sentence.text,
                 startFrame: frameCursor,
-                endFrame: frameCursor + frames
+                endFrame: frameCursor + frames + pauseFrames
             ))
-            frameCursor += frames
+            frameCursor += frames + pauseFrames
 
             reportProgress(progress, done: i + 1, total: sentences.count)
         }

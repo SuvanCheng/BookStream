@@ -6,10 +6,13 @@ import Foundation
 public struct Sentence: Identifiable, Sendable, Equatable {
     public let id: Int
     public let text: String
+    /// 本句之后的停顿（秒）：段落末尾（空行）更长，句末为短停顿，营造真人朗读节奏。
+    public let pauseAfter: Double
 
-    public init(id: Int, text: String) {
+    public init(id: Int, text: String, pauseAfter: Double = 0) {
         self.id = id
         self.text = text
+        self.pauseAfter = pauseAfter
     }
 }
 
@@ -94,22 +97,38 @@ public enum TextProcessor {
     /// 标点分句：以句号/问号/感叹号/换行为边界；逗号、分号仅作句中停顿。
     /// 合并过短碎片（< 2 字符）至上一句，保证语流连贯。
     public static func splitSentences(_ text: String) -> [String] {
-        var sentences: [String] = []
+        splitSentencesWithPauses(text).map { $0.text }
+    }
+
+    /// 分句并标注句后停顿（秒）：空行后的段落末尾 0.7s，普通句末 0.25s。
+    public static func splitSentencesWithPauses(_ text: String) -> [(text: String, pauseAfter: Double)] {
+        var sentences: [(text: String, pauseAfter: Double)] = []
         var current = ""
         var pendingTerminator = ""
+        var lastFlushedIndex: Int? = nil
         let boundaries: Set<Character> = [".", "!", "?", "。", "！", "？", "\n"]
 
         func flush() {
             let s = (current + pendingTerminator)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !s.isEmpty { sentences.append(s) }
+            if !s.isEmpty {
+                sentences.append((s, 0.25))
+                lastFlushedIndex = sentences.count - 1
+            }
             current = ""
             pendingTerminator = ""
         }
 
         for ch in text {
             if ch == "\n" {
-                if !current.isEmpty || !pendingTerminator.isEmpty { flush() }
+                if current.isEmpty && pendingTerminator.isEmpty {
+                    // 空行 → 上一句是段落末尾
+                    if let idx = lastFlushedIndex {
+                        sentences[idx].pauseAfter = 0.7
+                    }
+                    continue
+                }
+                flush()
                 continue
             }
             if boundaries.contains(ch) {
@@ -126,11 +145,13 @@ public enum TextProcessor {
         }
         if !current.isEmpty || !pendingTerminator.isEmpty { flush() }
 
-        // 合并过短碎片
-        var merged: [String] = []
+        // 合并过短碎片（< 2 字符）至上一句，保留其停顿标记
+        var merged: [(text: String, pauseAfter: Double)] = []
         for s in sentences {
-            if s.count < 2, let last = merged.last {
-                merged[merged.count - 1] = last + " " + s
+            if s.text.count < 2, var last = merged.last {
+                last.text += " " + s.text
+                last.pauseAfter = max(last.pauseAfter, s.pauseAfter)
+                merged[merged.count - 1] = last
             } else {
                 merged.append(s)
             }
@@ -149,9 +170,9 @@ public enum TextProcessor {
         default:
             throw BookStreamError.unsupportedFile(ext)
         }
-        let parts = splitSentences(rawText)
+        let parts = splitSentencesWithPauses(rawText)
         guard !parts.isEmpty else { throw BookStreamError.unsupportedFile("空文本") }
-        return parts.enumerated().map { Sentence(id: $0.offset, text: $0.element) }
+        return parts.enumerated().map { Sentence(id: $0.offset, text: $0.element.text, pauseAfter: $0.element.pauseAfter) }
     }
 
     /// 多编码容错读取（UTF-8 / UTF-16 / Latin-1 兜底）。

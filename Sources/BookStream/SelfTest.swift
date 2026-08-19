@@ -112,9 +112,9 @@ enum SelfTest {
             }
 
             let sentences = [
-                "Hello, this is the BookStream self test.",
-                "The quick brown fox jumps over the lazy dog.",
-                "Offline speech synthesis and video rendering work correctly."
+                Sentence(id: 0, text: "Hello, this is the BookStream self test."),
+                Sentence(id: 1, text: "The quick brown fox jumps over the lazy dog."),
+                Sentence(id: 2, text: "Offline speech synthesis and video rendering work correctly.", pauseAfter: 0.7),
             ]
 
             // 1) TTS 离线抓轨 → WAV + 时间轴
@@ -138,6 +138,22 @@ enum SelfTest {
             let wavSize = (try? fm.attributesOfItem(atPath: wavURL.path)[.size]) as? Int ?? 0
             guard wavSize > 44_000 else { throw BookStreamError.audioRenderFailed("WAV 过小: \(wavSize)") }
             print("TTS OK: \(String(format: "%.2f", totalDuration))s 音频, \(result.segments.count) 段, WAV \(wavSize) 字节")
+
+            // 1.4) 停顿感验证：pauseScale 生效（0× vs 2× 时长应明显不同）
+            let pause0 = try await engine.renderBook(
+                sentences: sentences, outputURL: dir.appendingPathComponent("pause0.wav"),
+                voiceIdentifier: nil, piperVoice: nil, rate: 0.5,
+                pauseScale: 0, progress: audioProgress, cancellation: cancelled
+            )
+            let pause2 = try await engine.renderBook(
+                sentences: sentences, outputURL: dir.appendingPathComponent("pause2.wav"),
+                voiceIdentifier: nil, piperVoice: nil, rate: 0.5,
+                pauseScale: 2, progress: audioProgress, cancellation: cancelled
+            )
+            let d0 = pause0.segments.last?.end ?? 0
+            let d2 = pause2.segments.last?.end ?? 0
+            guard d2 > d0 + 0.5 else { throw BookStreamError.audioRenderFailed("停顿感无效: \(d0) vs \(d2)") }
+            print("PAUSE OK: 0×停顿 \(String(format: "%.2f", d0))s → 2×停顿 \(String(format: "%.2f", d2))s")
 
             // 1.5) 本地 AI 音色（Piper）：若已安装模型则端到端验证
             let models = PiperTTS.listModels()
@@ -216,11 +232,29 @@ enum SelfTest {
             let renderer = VideoRenderer()
             let mp4URL = dir.appendingPathComponent("selftest.mp4")
             let videoProgress: @Sendable @MainActor (Double) -> Void = { _ in }
+            // 环境变量 BOOKSTREAM_WATERMARK=1 时启用测试水印（验证水印绘制/缩放路径）；
+            // BOOKSTREAM_WATERMARK_IMAGE=<png路径> 时改用导入图片水印（右上角）。
+            var testWatermark: WatermarkSettings = .default
+            if ProcessInfo.processInfo.environment["BOOKSTREAM_WATERMARK"] == "1" {
+                testWatermark = WatermarkSettings(
+                    enabled: true, text: "BookStream 测试水印", color: .yellow,
+                    fontSize: 40, opacity: 0.9, position: .topLeft
+                )
+            }
+            if let imgPath = ProcessInfo.processInfo.environment["BOOKSTREAM_WATERMARK_IMAGE"],
+               let imgData = try? Data(contentsOf: URL(fileURLWithPath: imgPath)) {
+                testWatermark = WatermarkSettings(
+                    enabled: true, text: "", color: .yellow,
+                    fontSize: 40, opacity: 1.0, position: .topRight,
+                    imageData: imgData, imageScale: 0.12
+                )
+            }
             try await renderer.render(
                 audioURL: wavURL,
                 segments: result.segments,
                 outputURL: mp4URL,
                 style: CaptionStyle(),
+                watermark: testWatermark,
                 progress: videoProgress,
                 cancellation: cancelled
             )

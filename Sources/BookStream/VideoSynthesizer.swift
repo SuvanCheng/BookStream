@@ -8,8 +8,8 @@ import AppKit
 
 // MARK: - 字幕样式（可调色）
 
-/// 纯 RGB 颜色（跨隔离域 Sendable 传递）。
-public struct CaptionColor: Sendable, Hashable {
+/// 纯 RGB 颜色（跨隔离域 Sendable 传递，可持久化）。
+public struct CaptionColor: Sendable, Hashable, Codable {
     public let red: Double
     public let green: Double
     public let blue: Double
@@ -40,12 +40,68 @@ public struct CaptionStyle: Sendable {
     public let highlight: CaptionColor
     public let normal: CaptionColor
     public let scrollSpeed: Double // 像素/秒，控制字幕上滚速度
+    public let scrollStrength: Double // 变速强度 0...1：句内速度变化幅度（0≈匀速，1≈句首句尾大缓动）
 
-    public init(highlight: CaptionColor = .vividOrange, normal: CaptionColor = .white, scrollSpeed: Double = 55) {
+    public init(highlight: CaptionColor = .vividOrange, normal: CaptionColor = .white, scrollSpeed: Double = 55, scrollStrength: Double = 0.5) {
         self.highlight = highlight
         self.normal = normal
         self.scrollSpeed = scrollSpeed
+        self.scrollStrength = scrollStrength
     }
+}
+
+/// 水印设置（文本或图片；位置/大小/透明度可调，可持久化）。
+public struct WatermarkSettings: Sendable, Codable, Equatable {
+    public enum Position: String, CaseIterable, Codable, Identifiable, Sendable {
+        case topLeft, topCenter, topRight
+        case midLeft, center, midRight
+        case bottomLeft, bottomCenter, bottomRight
+        public var id: String { rawValue }
+        public var label: String {
+            switch self {
+            case .topLeft: return "左上"
+            case .topCenter: return "上中"
+            case .topRight: return "右上"
+            case .midLeft: return "左中"
+            case .center: return "正中"
+            case .midRight: return "右中"
+            case .bottomLeft: return "左下"
+            case .bottomCenter: return "下中"
+            case .bottomRight: return "右下"
+            }
+        }
+    }
+
+    public var enabled: Bool
+    public var text: String
+    public var color: CaptionColor
+    public var fontSize: Double        // 相对 1080p 的字号（随分辨率缩放）
+    public var opacity: Double         // 0-1
+    public var position: Position
+    public var imageData: Data?        // 导入的图片（PNG/JPEG）；nil = 文本水印
+    public var imageScale: Double      // 图片宽度相对画布宽度比例（0.05-0.4）
+
+    public init(
+        enabled: Bool = false,
+        text: String = "BookStream",
+        color: CaptionColor = .white,
+        fontSize: Double = 36,
+        opacity: Double = 0.35,
+        position: Position = .bottomRight,
+        imageData: Data? = nil,
+        imageScale: Double = 0.12
+    ) {
+        self.enabled = enabled
+        self.text = text
+        self.color = color
+        self.fontSize = fontSize
+        self.opacity = opacity
+        self.position = position
+        self.imageData = imageData
+        self.imageScale = imageScale
+    }
+
+    public static let `default` = WatermarkSettings()
 }
 
 /// 视频输出分辨率预设（含推荐码率）。
@@ -93,6 +149,7 @@ public final class VideoRenderer: @unchecked Sendable {
 
     /// 调试帧转储目录（环境变量 BOOKSTREAM_FRAMEDUMP 指定时启用）。
     static let frameDumpDir: String? = ProcessInfo.processInfo.environment["BOOKSTREAM_FRAMEDUMP"]
+    static let frameDumpEvery: Int = Int(ProcessInfo.processInfo.environment["BOOKSTREAM_FRAMEDUMP_EVERY"] ?? "") ?? 30
 
     public init() {}
 
@@ -102,6 +159,7 @@ public final class VideoRenderer: @unchecked Sendable {
         outputURL: URL,
         style: CaptionStyle,
         resolution: VideoResolution = .p1080,
+        watermark: WatermarkSettings = .default,
         progress: @escaping @Sendable @MainActor (Double) -> Void,
         cancellation: @escaping @Sendable () -> Bool
     ) async throws {
@@ -114,6 +172,7 @@ public final class VideoRenderer: @unchecked Sendable {
                         outputURL: outputURL,
                         style: style,
                         resolution: resolution,
+                        watermark: watermark,
                         progress: progress,
                         cancellation: cancellation
                     )
@@ -133,6 +192,7 @@ public final class VideoRenderer: @unchecked Sendable {
         outputURL: URL,
         style: CaptionStyle,
         resolution: VideoResolution,
+        watermark: WatermarkSettings,
         progress: @escaping @Sendable @MainActor (Double) -> Void,
         cancellation: @escaping @Sendable () -> Bool
     ) throws {
@@ -275,6 +335,7 @@ public final class VideoRenderer: @unchecked Sendable {
                             videoTime: videoTime,
                             totalDuration: totalDuration,
                             style: style,
+                            watermark: watermark,
                             layoutCache: &layoutCache,
                             pool: pool
                         ) {
@@ -367,11 +428,14 @@ public final class VideoRenderer: @unchecked Sendable {
         id * 2 + (highlight ? 1 : 0)
     }
 
-    /// 从下往上滚动字幕流（锚定中心 + 无重叠约束）：
-    /// - 当前句固定在画面中心（高亮 + 72pt 粗体，无底色），整句朗读期间不漂移；
-    /// - 已结束的历史句从中心向上滚动，5 秒内淡化淡出；未开始的未来句从底部上移接近，
-    ///   3 秒内渐显进入——历史与未来同屏可见；
-    /// - 逐行约束传递：按实际行高 + 间距强制最小间隔，任意两行绝不重叠；
+    /// 从下往上滚动字幕流（软锚定 + 无感变速）：
+    /// - 当前句不再钉死在中心：在整句朗读期间从中心缓升一个行距（spacing），
+    ///   全程速度连续（句首句尾缓入缓出，句内按「变速强度」决定变化幅度）——
+    ///   长句期间画面永不静止，观众无感速度切换；
+    /// - 未开始的后续句始终紧贴上一行堆叠在下方（队列），随当前句同步缓升，
+    ///   到句末恰好抵达中心接棒——任意时刻都能看到接下来的内容在流动，无冻结、无跳变；
+    /// - 历史句以固定速度向上退场（0.3s 缓加速），旧句淡出；
+    /// - 句间停顿：下一句锚在中心短暂「呼吸」，之后自然接棒；
     /// - 排版按 (id, 是否高亮) 双键缓存，避免逐帧重建。
     private func drawRollingCaptions(
         in ctx: CGContext,
@@ -385,103 +449,162 @@ public final class VideoRenderer: @unchecked Sendable {
         // 所有布局量按画布高度相对 1080p 等比缩放（480p/720p/1080p/4K 观感一致）。
         let scale = canvas.height / 1080.0
         let centerY = canvas.height / 2
-        let speed = CGFloat(style.scrollSpeed) * scale
-        let halfWindow: CGFloat = 640 * scale
-        let rangeSeconds = Double(halfWindow) / Double(speed)
-
-        let lo = lowerBound(segments: segments, startAtLeast: time - rangeSeconds)
-        let hi = upperBound(segments: segments, startAtMost: time + rangeSeconds)
-        guard lo < hi else { return }
+        let vBase = CGFloat(style.scrollSpeed) * scale
         let maxWidth = canvas.width - 200 * scale
         let minGap: CGFloat = 22 * scale
+        let n = segments.count
+        // 变速强度：句内速度变化幅度（0≈匀速滚动，1≈句首句尾大幅缓动；曲线全程连续无跳变）
+        let easeFrac = 0.02 + 0.20 * min(max(style.scrollStrength, 0), 1)
+        let m = 1 / (1 - 2 * easeFrac)          // 中段线性斜率
+        let a = 0.5 - m * easeFrac               // 缓入段终点值（S(f)）
+        // 历史行退场加速时长（速度从 0 缓升到 vBase，保证交接处速度连续）
+        let easeExit: Double = 0.3
 
         // ---- 1. 判定当前句 ----
         var currentIdx: Int?
-        for i in lo..<hi where time >= segments[i].start && time < segments[i].end {
+        for i in 0..<n where time >= segments[i].start && time < segments[i].end {
             currentIdx = i
             break
         }
 
-        // ---- 2. 确保排版缓存存在（同时得到各句行高）----
-        var heights: [Int: CGFloat] = [:]
-        for i in lo..<hi {
-            let seg = segments[i]
-            let isCurrent = (i == currentIdx)
-            let key = cacheKey(seg.id, highlight: isCurrent)
-            let layout: LineLayout
-            if let cached = layoutCache[key] {
-                layout = cached
-            } else {
-                let font = NSFont.systemFont(
-                    ofSize: (isCurrent ? 72 : 44) * scale,
-                    weight: isCurrent ? .bold : .regular
-                )
-                let color = (isCurrent ? style.highlight : style.normal).nsColor
-                layout = makeLineLayout(text: seg.text, font: font, color: color, maxWidth: maxWidth)
-                layoutCache[key] = layout
-            }
-            heights[i] = layout.size.height
+        // ---- 2. 排版缓存与行高（惰性，跨帧复用）----
+        func ensureLayout(_ i: Int, highlight: Bool) -> LineLayout {
+            let key = cacheKey(segments[i].id, highlight: highlight)
+            if let cached = layoutCache[key] { return cached }
+            let font = NSFont.systemFont(
+                ofSize: (highlight ? 72 : 44) * scale,
+                weight: highlight ? .bold : .regular
+            )
+            let color = (highlight ? style.highlight : style.normal).nsColor
+            let layout = makeLineLayout(text: segments[i].text, font: font, color: color, maxWidth: maxWidth)
+            layoutCache[key] = layout
+            return layout
         }
-
+        func lineHeight(_ i: Int) -> CGFloat {
+            ensureLayout(i, highlight: false).size.height
+        }
+        /// 两行之间的安全间距（行高均值 + 最小间隙）。
         func spacing(_ a: Int, _ b: Int) -> CGFloat {
-            (heights[a]! + heights[b]!) / 2 + minGap
+            (lineHeight(a) + lineHeight(b)) / 2 + minGap
+        }
+        /// 某句作为当前句滑动/退场的总位移：与下一句的间距（最后一句用自身行高 + 间隙）。
+        func glideSpan(_ i: Int) -> CGFloat {
+            i + 1 < n ? spacing(i, i + 1) : lineHeight(i) + minGap
         }
 
-        // ---- 3. 定位（坐标系：y 向上为正，y=0 底边、y=H 顶边；当前句锚定中心）----
-        // 关键修正：CTFrameDraw 在非翻转的 CGBitmapContext 中直接输出正向文字；
-        // 此前加了 translate+scale(-1) 翻转，实测导致文字整体旋转 180°（上下颠倒+左右镜像）。
+        // 句内缓动进度 S(τ)：τ∈[0,1]，S(0)=0、S(1)=1，值域 [0,1]，一阶连续。
+        // 分段：缓入[0,f] → 线性[f,1-f] → 缓出[1-f,1]；f = easeFrac。
+        func glideProgress(_ age: Double, _ dur: Double) -> CGFloat {
+            guard dur > 0 else { return 1 }
+            var tau = CGFloat(age / dur)
+            tau = min(max(tau, 0), 1)
+            if tau < easeFrac {
+                let u = tau / easeFrac
+                return a * (3 * u * u - 2 * u * u * u) + m * easeFrac * (u * u * u - u * u)
+            } else if tau > 1 - easeFrac {
+                let v = (1 - tau) / easeFrac
+                let g = a * (3 * v * v - 2 * v * v * v) + m * easeFrac * (v * v * v - v * v)
+                return 1 - g
+            } else {
+                return a + m * (tau - easeFrac)
+            }
+        }
+
+        // 历史行退场位移：从 t=0 起速度 0→vBase 缓升（0.3s），之后匀速 vBase。
+        // 积分 ∫₀ᵗ vBase·(3τ²/T² − 2τ³/T³)dτ = vBase·(t³/T² − t⁴/(2T³))，t≥T 后 = vBase·(t − T/2)。
+        func exitOffset(_ dt: Double) -> CGFloat {
+            let t = CGFloat(dt)
+            let T = CGFloat(easeExit)
+            if t < T {
+                return vBase * (t * t * t / (T * T) - t * t * t * t / (2 * T * T * T))
+            } else {
+                return vBase * (t - T / 2)
+            }
+        }
+
+        // ---- 3. 定位（坐标系：y 向上为正，y=0 底边、y=H 顶边）----
         var yCenter: [Int: CGFloat] = [:]
+        var lineAlpha: [Int: CGFloat] = [:]
 
         if let ci = currentIdx {
-            yCenter[ci] = centerY
-            // 历史（上方，y 更大）：从当前句向上约束
-            if ci > lo {
-                for i in stride(from: ci - 1, through: lo, by: -1) {
-                    let raw = centerY + CGFloat(time - segments[i].end) * speed
-                    yCenter[i] = max(raw, yCenter[i + 1]! + spacing(i, i + 1))
+            // 当前句：中心 → 中心 + glideSpan，随句内进度缓动
+            let dur = max(segments[ci].end - segments[ci].start, 0)
+            let age = max(time - segments[ci].start, 0)
+            let sp = glideSpan(ci)
+            let yc = centerY + sp * glideProgress(age, dur)
+            yCenter[ci] = yc
+            lineAlpha[ci] = 1.0
+            _ = ensureLayout(ci, highlight: true)
+
+            // 历史（上方）：退场 + 不越过上一条的约束
+            if ci > 0 {
+                for i in stride(from: ci - 1, through: 0, by: -1) {
+                    let raw = centerY + glideSpan(i) + exitOffset(time - segments[i].end)
+                    yCenter[i] = (i + 1 < n) ? max(raw, yCenter[i + 1]! + spacing(i, i + 1)) : raw
+                    if yCenter[i]! > canvas.height + 320 * scale { break }
+                    let age = time - segments[i].end
+                    lineAlpha[i] = max(0.30, 1.0 - CGFloat(age) / 5.0 * 0.70)
                 }
             }
-            // 未来（下方，y 更小）：从当前句向下约束
-            if ci + 1 < hi {
-                for i in (ci + 1)..<hi {
-                    let raw = centerY - CGFloat(segments[i].start - time) * speed
-                    yCenter[i] = min(raw, yCenter[i - 1]! - spacing(i - 1, i))
+
+            // 未来（下方）：队列堆叠——紧贴上一行（max 保证不高于原始排程），
+            // 随当前句同步缓升，句末恰好到达中心接棒。
+            if ci + 1 < n {
+                var prev = yc
+                var depth = 0
+                for i in (ci + 1)..<n {
+                    depth += 1
+                    let raw = centerY - CGFloat(segments[i].start - time) * vBase
+                    let stacked = prev - spacing(i - 1, i)
+                    let y = max(raw, stacked)
+                    yCenter[i] = y
+                    prev = y
+                    if y < -320 * scale { break }
+                    lineAlpha[i] = max(0.40, 1.0 - 0.18 * CGFloat(depth))
                 }
             }
         } else {
-            // 无当前句（间隙）：以「下一句」为锚点（不钉在中心，仅用于约束）
+            // 无当前句（开头 / 句间停顿 / 结尾）
             let nxt = upperBound(segments: segments, startAtMost: time)
-            if nxt >= hi {
-                // 全部为历史：从中心向上堆叠
-                for i in stride(from: hi - 1, through: lo, by: -1) {
-                    let raw = centerY + CGFloat(time - segments[i].end) * speed
-                    yCenter[i] = (i + 1 < hi) ? max(raw, yCenter[i + 1]! + spacing(i, i + 1)) : raw
+            if nxt < n {
+                // 下一句锚在中心短暂呼吸；其下队列堆叠
+                yCenter[nxt] = centerY
+                lineAlpha[nxt] = 0.9
+                var prev = centerY
+                var depth = 0
+                for i in (nxt + 1)..<n {
+                    depth += 1
+                    let raw = centerY - CGFloat(segments[i].start - time) * vBase
+                    let stacked = prev - spacing(i - 1, i)
+                    let y = max(raw, stacked)
+                    yCenter[i] = y
+                    prev = y
+                    if y < -320 * scale { break }
+                    lineAlpha[i] = max(0.40, 1.0 - 0.18 * CGFloat(depth))
                 }
-            } else if nxt <= lo {
-                // 全部为未来：向中心上移接近
-                for i in lo..<hi {
-                    let raw = centerY - CGFloat(segments[i].start - time) * speed
-                    yCenter[i] = (i > lo) ? min(raw, yCenter[i - 1]! - spacing(i - 1, i)) : raw
+                // 历史退场
+                if nxt > 0 {
+                    for i in stride(from: nxt - 1, through: 0, by: -1) {
+                        let raw = centerY + glideSpan(i) + exitOffset(time - segments[i].end)
+                        yCenter[i] = (i + 1 < n) ? max(raw, yCenter[i + 1]! + spacing(i, i + 1)) : raw
+                        if yCenter[i]! > canvas.height + 320 * scale { break }
+                        let age = time - segments[i].end
+                        lineAlpha[i] = max(0.30, 1.0 - CGFloat(age) / 5.0 * 0.70)
+                    }
                 }
             } else {
-                // 锚点下一句在窗口内
-                yCenter[nxt] = centerY - CGFloat(segments[nxt].start - time) * speed
-                if nxt > lo {
-                    for i in stride(from: nxt - 1, through: lo, by: -1) {
-                        let raw = centerY + CGFloat(time - segments[i].end) * speed
-                        yCenter[i] = max(raw, yCenter[i + 1]! + spacing(i, i + 1))
-                    }
-                }
-                if nxt + 1 < hi {
-                    for i in (nxt + 1)..<hi {
-                        let raw = centerY - CGFloat(segments[i].start - time) * speed
-                        yCenter[i] = min(raw, yCenter[i - 1]! - spacing(i - 1, i))
-                    }
+                // 全部为历史（结尾）：从最后一句向上堆叠退场
+                for i in stride(from: n - 1, through: 0, by: -1) {
+                    let raw = centerY + glideSpan(i) + exitOffset(time - segments[i].end)
+                    yCenter[i] = (i + 1 < n) ? max(raw, yCenter[i + 1]! + spacing(i, i + 1)) : raw
+                    if yCenter[i]! > canvas.height + 320 * scale { break }
+                    let age = time - segments[i].end
+                    lineAlpha[i] = max(0.30, 1.0 - CGFloat(age) / 5.0 * 0.70)
                 }
             }
         }
 
-        // ---- 4. 直接绘制（不再翻转坐标系；先画普通行，再画当前行保证层级）----
+        // ---- 4. 直接绘制（非翻转坐标系；先画普通行，再画当前行保证层级）----
         func drawLine(_ i: Int, isCurrent: Bool) {
             let seg = segments[i]
             guard let y = yCenter[i], let layout = layoutCache[cacheKey(seg.id, highlight: isCurrent)] else { return }
@@ -490,28 +613,27 @@ public final class VideoRenderer: @unchecked Sendable {
             let alpha: CGFloat
             if isCurrent {
                 alpha = 1.0
-            } else if time < seg.start {
-                let remaining = CGFloat(seg.start - time)
-                alpha = min(1.0, max(0.35, 1.0 - remaining / 3.0 * 0.65))
+            } else if let a = lineAlpha[i] {
+                alpha = a
             } else {
-                let age = CGFloat(time - seg.end)
-                alpha = max(0.30, 1.0 - age / 5.0 * 0.70)
+                alpha = 0.85
             }
 
             let w = min(layout.size.width, maxWidth)
             let h = layout.size.height
             let rect = CGRect(x: (canvas.width - w) / 2, y: y - h / 2, width: w, height: h)
 
-            // 纯色高对比文字直接绘制，无需投影也无需 save/restore：
-            // 每帧都是全新 CGContext，且不再是纯黑底上不可见的投影所需的离屏开销。
+            // 纯色高对比文字直接绘制：每帧都是全新 CGContext，无投影开销。
             ctx.setAlpha(alpha)
             let path = CGPath(rect: rect, transform: nil)
             let frame = CTFramesetterCreateFrame(layout.framesetter, CFRange(location: 0, length: 0), path, nil)
             CTFrameDraw(frame, ctx)
         }
 
-        for i in lo..<hi where i != currentIdx {
-            drawLine(i, isCurrent: false)
+        for i in 0..<n where i != currentIdx {
+            if let y = yCenter[i], y > -320 * scale, y < canvas.height + 320 * scale {
+                drawLine(i, isCurrent: false)
+            }
         }
         if let ci = currentIdx {
             drawLine(ci, isCurrent: true)
@@ -568,6 +690,7 @@ public final class VideoRenderer: @unchecked Sendable {
         videoTime: Double,
         totalDuration: Double,
         style: CaptionStyle,
+        watermark: WatermarkSettings,
         layoutCache: inout [Int: LineLayout],
         pool: CVPixelBufferPool
     ) -> CVPixelBuffer? {
@@ -612,11 +735,98 @@ public final class VideoRenderer: @unchecked Sendable {
             ctx.fill(CGRect(x: 0, y: 22 * scale, width: CGFloat(width) * fraction, height: 6 * scale))
         }
 
-        // 调试帧转储：BOOKSTREAM_FRAMEDUMP=/tmp/fd 时每 30 帧存一张 PNG
-        if let dumpDir = Self.frameDumpDir, Int64(videoTime * Double(fps)) % 30 == 0 {
-            dumpFrame(ctx, index: Int64(videoTime * Double(fps)), dir: dumpDir)
+        // 水印
+        if watermark.enabled {
+            drawWatermark(watermark, in: ctx, canvas: fullRect.size)
+        }
+
+        // 调试帧转储：BOOKSTREAM_FRAMEDUMP=/tmp/fd 时每 30 帧（可被 BOOKSTREAM_FRAMEDUMP_EVERY 覆盖）存一张 PNG
+        if let dumpDir = Self.frameDumpDir {
+            let every = Self.frameDumpEvery
+            if Int64(videoTime * Double(fps)) % Int64(every) == 0 {
+                dumpFrame(ctx, index: Int64(videoTime * Double(fps)), dir: dumpDir)
+            }
         }
         return pixelBuffer
+    }
+
+    // MARK: - 水印
+
+    private static let imageCacheLock = NSLock()
+    private nonisolated(unsafe) static var watermarkImageCache: [Data: CGImage] = [:]
+
+    private func loadWatermarkImage(_ data: Data) -> CGImage? {
+        Self.imageCacheLock.lock()
+        defer { Self.imageCacheLock.unlock() }
+        if let cached = Self.watermarkImageCache[data] { return cached }
+        guard let image = CGImageSourceCreateWithData(data as CFData, nil)
+            .flatMap({ CGImageSourceCreateImageAtIndex($0, 0, nil) }) else { return nil }
+        Self.watermarkImageCache[data] = image
+        return image
+    }
+
+    private func drawWatermark(_ wm: WatermarkSettings, in ctx: CGContext, canvas: CGSize) {
+        let scale = CGFloat(canvas.height / 1080.0)
+        let margin: CGFloat = 26 * scale
+        let text = wm.text.isEmpty ? "BookStream" : wm.text
+
+        if let data = wm.imageData, let image = loadWatermarkImage(data) {
+            let w = canvas.width * CGFloat(wm.imageScale)
+            let h = w * CGFloat(image.height) / CGFloat(image.width)
+            let origin = watermarkRectOrigin(size: CGSize(width: w, height: h), position: wm.position, canvas: canvas, margin: margin)
+            ctx.saveGState()
+            ctx.setAlpha(CGFloat(wm.opacity))
+            // 非翻转上下文绘制图片会上下颠倒，先翻转再绘制
+            ctx.translateBy(x: origin.x, y: origin.y + h)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+            ctx.restoreGState()
+        } else {
+            let font = NSFont.systemFont(ofSize: CGFloat(wm.fontSize) * scale, weight: .regular)
+            let attr = NSMutableAttributedString(string: text, attributes: [
+                .font: font,
+                .foregroundColor: wm.color.nsColor,
+            ])
+            let line = CTLineCreateWithAttributedString(attr)
+            var ascent: CGFloat = 0
+            var descent: CGFloat = 0
+            let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, nil))
+            let size = CGSize(width: width, height: ascent + descent)
+            let x: CGFloat
+            switch wm.position {
+            case .topLeft, .midLeft, .bottomLeft: x = margin
+            case .topCenter, .center, .bottomCenter: x = (canvas.width - size.width) / 2
+            case .topRight, .midRight, .bottomRight: x = canvas.width - margin - size.width
+            }
+            let blockBottom: CGFloat
+            switch wm.position {
+            case .topLeft, .topCenter, .topRight: blockBottom = canvas.height - margin - size.height
+            case .midLeft, .center, .midRight: blockBottom = (canvas.height - size.height) / 2
+            case .bottomLeft, .bottomCenter, .bottomRight: blockBottom = margin
+            }
+            ctx.saveGState()
+            ctx.setAlpha(CGFloat(wm.opacity))
+            ctx.textPosition = CGPoint(x: x, y: blockBottom + descent)
+            CTLineDraw(line, ctx)
+            ctx.restoreGState()
+        }
+    }
+
+    /// 图片水印矩形左下角坐标（y 向上）。
+    private func watermarkRectOrigin(size: CGSize, position: WatermarkSettings.Position, canvas: CGSize, margin: CGFloat) -> CGPoint {
+        let x: CGFloat
+        switch position {
+        case .topLeft, .midLeft, .bottomLeft: x = margin
+        case .topCenter, .center, .bottomCenter: x = (canvas.width - size.width) / 2
+        case .topRight, .midRight, .bottomRight: x = canvas.width - margin - size.width
+        }
+        let y: CGFloat
+        switch position {
+        case .topLeft, .topCenter, .topRight: y = canvas.height - margin - size.height
+        case .midLeft, .center, .midRight: y = (canvas.height - size.height) / 2
+        case .bottomLeft, .bottomCenter, .bottomRight: y = margin
+        }
+        return CGPoint(x: x, y: y)
     }
 
     /// 调试：把当前帧像素原样写出为 PNG（不经过任何坐标系变换，供方向性检查）。

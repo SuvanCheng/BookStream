@@ -66,9 +66,11 @@ final class AppModel: ObservableObject {
     @Published var voices: [VoiceInfo] = []
     @Published var selectedVoiceID: String?
     @Published var speechRate: Float = 0.5
+    @Published var pauseScale: Float = 1.0   // 句间/段间停顿倍数（0=无停顿，2=两倍）
     @Published var exportMode: ExportMode = .video
     @Published var highlightColor: CaptionColor = .vividOrange
     @Published var videoResolution: VideoResolution = .p1080
+    @Published var scrollStrength: Double = 0.5   // 变速强度：句内滚动速度变化幅度 0...1
 
     // 本地 AI 音色（Piper）
     @Published var piperModels: [PiperVoice] = []
@@ -88,6 +90,9 @@ final class AppModel: ObservableObject {
     // 字幕旁白溢出策略（语音长于字幕窗口时：顺延 / 截断）
     @Published var subtitleOverflowPolicy: SubtitleOverflowPolicy = .extend
 
+    // 水印（视频导出用，UserDefaults 持久化）
+    @Published var watermark: WatermarkSettings = AppModel.loadWatermark()
+
     // 运行状态
     @Published var isProcessing = false
     @Published var progress: Double = 0
@@ -100,6 +105,7 @@ final class AppModel: ObservableObject {
     private let cancelFlag = OSAllocatedUnfairLock(initialState: false)
     private var hasUserPickedVoice = false
     private var previewSynthesizer: AVSpeechSynthesizer?
+    private var previewAudioPlayer: AVAudioPlayer?
 
     // MARK: - 派生信息
 
@@ -263,6 +269,49 @@ final class AppModel: ObservableObject {
     /// 用户手动改过声音后，不再按内容语言自动切换。
     func markVoicePickedByUser() {
         hasUserPickedVoice = true
+    }
+
+    /// 试听当前选中的 AI 音色（本地合成一句样例并播放）。
+    func previewPiperVoice() {
+        guard piperEngineInstalled, let voice = selectedPiperVoice else { return }
+        log("正在合成 AI 试听（\(voice.displayName) · \(voice.language)）...")
+        Task.detached(priority: .userInitiated) {
+            do {
+                let buffers = try PiperTTS().render(
+                    text: "This is a preview of the local AI voice. 你好，这是本地 AI 音色的试听。",
+                    voice: voice, rate: 0.5
+                )
+                let tmp = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("piper-preview-\(UUID().uuidString).wav")
+                let sr = buffers.first?.format.sampleRate ?? 16000
+                let file = try AVAudioFile(forWriting: tmp, settings: [
+                    AVFormatIDKey: kAudioFormatLinearPCM,
+                    AVSampleRateKey: sr,
+                    AVNumberOfChannelsKey: 1,
+                    AVLinearPCMBitDepthKey: 16,
+                    AVLinearPCMIsFloatKey: false,
+                    AVLinearPCMIsBigEndianKey: false,
+                    AVLinearPCMIsNonInterleaved: false,
+                ], commonFormat: .pcmFormatFloat32, interleaved: false)
+                for buf in buffers { try file.write(from: buf) }
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self.previewAudioPlayer = try? AVAudioPlayer(contentsOf: tmp)
+                        self.previewAudioPlayer?.play()
+                        self.log("AI 音色试听播放中（\(voice.displayName)）")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+                            try? FileManager.default.removeItem(at: tmp)
+                        }
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self.log("AI 音色试听失败: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - 本地 AI 音色（Piper）
@@ -560,11 +609,12 @@ final class AppModel: ObservableObject {
             case (.book(_, let sentences), .audioSRT):
                 log("开始 TTS 离线抓轨（\(sentences.count) 句）...")
                 let result = try await engine.renderBook(
-                    sentences: sentences.map(\.text),
+                    sentences: sentences,
                     outputURL: wavURL,
                     voiceIdentifier: selectedVoiceID,
                     piperVoice: selectedPiperVoice,
                     rate: speechRate,
+                    pauseScale: pauseScale,
                     progress: { [weak self] done, total in
                         self?.updateProgress(Double(done) / Double(max(total, 1)), text: "TTS 抓轨 \(done)/\(total) 句")
                     },
@@ -587,11 +637,12 @@ final class AppModel: ObservableObject {
                 // 视频模式完全自包含：内部抓轨仅用于生成音频轨，不产出/依赖任何 .srt 文件
                 log("内部 TTS 抓轨（视频模式自动生成音频轨，不涉及 SRT）...")
                 let result = try await engine.renderBook(
-                    sentences: sentences.map(\.text),
+                    sentences: sentences,
                     outputURL: tmpWAV,
                     voiceIdentifier: selectedVoiceID,
                     piperVoice: selectedPiperVoice,
                     rate: speechRate,
+                    pauseScale: pauseScale,
                     progress: { [weak self] done, total in
                         self?.updateProgress(Double(done) / Double(max(total, 1)), text: "TTS 抓轨 \(done)/\(total) 句")
                     },
@@ -604,8 +655,9 @@ final class AppModel: ObservableObject {
                     audioURL: tmpWAV,
                     segments: result.segments,
                     outputURL: mp4URL,
-                    style: CaptionStyle(highlight: highlightColor),
+                    style: CaptionStyle(highlight: highlightColor, scrollStrength: scrollStrength),
                     resolution: videoResolution,
+                    watermark: watermark,
                     progress: { [weak self] p in
                         self?.updateProgress(p, text: "视频渲染 \(Int(p * 100))%")
                     },
@@ -659,8 +711,9 @@ final class AppModel: ObservableObject {
                         audioURL: companion,
                         segments: segments,
                         outputURL: mp4URL,
-                        style: CaptionStyle(highlight: highlightColor),
+                        style: CaptionStyle(highlight: highlightColor, scrollStrength: scrollStrength),
                         resolution: videoResolution,
+                        watermark: watermark,
                         progress: { [weak self] p in
                             self?.updateProgress(p, text: "视频渲染 \(Int(p * 100))%")
                         },
@@ -690,8 +743,9 @@ final class AppModel: ObservableObject {
                         audioURL: tmpWAV,
                         segments: result.segments,
                         outputURL: mp4URL,
-                        style: CaptionStyle(highlight: highlightColor),
+                        style: CaptionStyle(highlight: highlightColor, scrollStrength: scrollStrength),
                         resolution: videoResolution,
+                        watermark: watermark,
                         progress: { [weak self] p in
                             self?.updateProgress(p, text: "视频渲染 \(Int(p * 100))%")
                         },
@@ -755,6 +809,22 @@ final class AppModel: ObservableObject {
         log("已复制全部日志（\(logLines.count) 行）到剪贴板")
     }
 
+    private static func loadWatermark() -> WatermarkSettings {
+        guard let data = UserDefaults.standard.data(forKey: "BookStream.watermark"),
+              let wm = try? JSONDecoder().decode(WatermarkSettings.self, from: data) else {
+            return .default
+        }
+        return wm
+    }
+
+    /// 更新水印并持久化。
+    func updateWatermark(_ wm: WatermarkSettings) {
+        watermark = wm
+        if let data = try? JSONEncoder().encode(wm) {
+            UserDefaults.standard.set(data, forKey: "BookStream.watermark")
+        }
+    }
+
     /// 应用版本号（唯一代码侧出处）：优先取 Bundle（由 build.sh 打包写入），
     /// 无 Bundle（纯命令行模式）时回退默认。升级版本号改 build.sh 的 CFBundleShortVersionString 即可。
     static let appVersion: String = {
@@ -813,6 +883,7 @@ struct ContentView: View {
             if model.exportMode == .video {
                 colorPalette
                 resolutionPicker
+                watermarkSection
                 if case .subtitles = model.inputKind {
                     companionAudioSection
                 }
@@ -839,26 +910,32 @@ struct ContentView: View {
             Text("AI 音色（本地 · 离线）").font(.caption).foregroundStyle(.secondary)
 
             if model.piperEngineInstalled {
-                Picker("AI 音色", selection: Binding(
-                    get: { model.selectedPiperVoiceID },
-                    set: { newID in
-                        model.selectedPiperVoiceID = newID
-                        if let voice = model.piperModels.first(where: { $0.id == newID }) {
-                            model.log("切换 AI 音色: \(voice.displayName) · \(voice.language)")
-                        } else {
-                            model.log("切换为系统声音")
+                HStack {
+                    Picker("AI 音色", selection: Binding(
+                        get: { model.selectedPiperVoiceID },
+                        set: { newID in
+                            model.selectedPiperVoiceID = newID
+                            if let voice = model.piperModels.first(where: { $0.id == newID }) {
+                                model.log("切换 AI 音色: \(voice.displayName) · \(voice.language)")
+                            } else {
+                                model.log("切换为系统声音")
+                            }
+                        }
+                    )) {
+                        Text("使用系统声音").tag(String?.none)
+                        ForEach(model.piperModels) { v in
+                            Text("\(v.displayName) · \(v.language)").tag(v.id as String?)
                         }
                     }
-                )) {
-                    Text("使用系统声音").tag(String?.none)
-                    ForEach(model.piperModels) { v in
-                        Text("\(v.displayName) · \(v.language)").tag(v.id as String?)
-                    }
+                    .labelsHidden()
+                    Spacer()
+                    Button("试听") { model.previewPiperVoice() }
+                        .font(.caption)
+                        .disabled(model.selectedPiperVoiceID == nil)
                 }
-                .labelsHidden()
 
                 if model.piperModels.isEmpty {
-                    Text("尚未下载音色模型，可下载中/英文各一个（约 20~60MB，一次性）")
+                    Text("尚未下载音色模型，可下载中/英文各一个（约 20~125MB，一次性）")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -866,7 +943,7 @@ struct ContentView: View {
                     if model.isModelDownloading {
                         Text("下载中...").font(.caption).foregroundStyle(.secondary)
                     } else {
-                        Button("下载英文音色") { model.downloadPiperModel(language: "en_US", dataset: "lessac") }
+                        Button("下载英文音色（LibriTTS-R 真人朗读）") { model.downloadPiperModel(language: "en_US", dataset: "libritts_r") }
                             .font(.caption)
                         Button("下载中文音色") { model.downloadPiperModel(language: "zh_CN", dataset: "huayan") }
                             .font(.caption)
@@ -1025,6 +1102,124 @@ struct ContentView: View {
                         .onTapGesture { model.highlightColor = c }
                 }
             }
+            HStack {
+                Text("变速强度").font(.caption).foregroundStyle(.secondary)
+                Text("0（匀速）").font(.caption2).foregroundStyle(.tertiary)
+                Slider(value: $model.scrollStrength, in: 0...1)
+                Text("1（缓动）").font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    /// 水印（文本/图片，位置/大小/透明度可调）。
+    private var watermarkSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle("水印", isOn: Binding(
+                get: { model.watermark.enabled },
+                set: { on in
+                    var wm = model.watermark
+                    wm.enabled = on
+                    model.updateWatermark(wm)
+                }
+            ))
+            .font(.caption)
+
+            if model.watermark.enabled {
+                Picker("类型", selection: Binding(
+                    get: { model.watermark.imageData == nil ? 0 : 1 },
+                    set: { kind in
+                        var wm = model.watermark
+                        if kind == 0 { wm.imageData = nil } else if wm.imageData == nil { wm.text = "" }
+                        model.updateWatermark(wm)
+                    }
+                )) {
+                    Text("文本").tag(0)
+                    Text("图片").tag(1)
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+
+                if model.watermark.imageData == nil {
+                    HStack {
+                        TextField("水印文本", text: Binding(
+                            get: { model.watermark.text },
+                            set: { var wm = model.watermark; wm.text = $0; model.updateWatermark(wm) }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                        Button("导入图片") { importWatermarkImage() }
+                            .font(.caption)
+                    }
+                    HStack(spacing: 8) {
+                        Text("颜色").font(.caption).foregroundStyle(.secondary)
+                        ForEach(AppModel.paletteColors, id: \.self) { c in
+                            Circle()
+                                .fill(Color(nsColor: c.nsColor))
+                                .frame(width: 14, height: 14)
+                                .overlay(Circle().stroke(model.watermark.color == c ? Color.primary : Color.clear, lineWidth: 2))
+                                .contentShape(Circle())
+                                .onTapGesture {
+                                    var wm = model.watermark
+                                    wm.color = c
+                                    model.updateWatermark(wm)
+                                }
+                        }
+                    }
+                } else {
+                    HStack {
+                        Text("已导入图片水印").font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("清除") {
+                            var wm = model.watermark
+                            wm.imageData = nil
+                            model.updateWatermark(wm)
+                        }
+                        .font(.caption)
+                    }
+                }
+
+                HStack {
+                    Text(model.watermark.imageData == nil ? "字号" : "大小").font(.caption).foregroundStyle(.secondary)
+                    Slider(
+                        value: model.watermark.imageData == nil
+                            ? Binding(get: { model.watermark.fontSize }, set: { var wm = model.watermark; wm.fontSize = $0; model.updateWatermark(wm) })
+                            : Binding(get: { model.watermark.imageScale }, set: { var wm = model.watermark; wm.imageScale = $0; model.updateWatermark(wm) }),
+                        in: model.watermark.imageData == nil ? 16...72 : 0.05...0.4
+                    )
+                }
+                HStack {
+                    Text("位置").font(.caption).foregroundStyle(.secondary)
+                    Picker("位置", selection: Binding(
+                        get: { model.watermark.position },
+                        set: { var wm = model.watermark; wm.position = $0; model.updateWatermark(wm) }
+                    )) {
+                        ForEach(WatermarkSettings.Position.allCases) { p in
+                            Text(p.label).tag(p)
+                        }
+                    }
+                    .labelsHidden()
+                }
+                HStack {
+                    Text("透明度").font(.caption).foregroundStyle(.secondary)
+                    Slider(value: Binding(
+                        get: { model.watermark.opacity },
+                        set: { var wm = model.watermark; wm.opacity = $0; model.updateWatermark(wm) }
+                    ), in: 0.05...1.0)
+                }
+            }
+        }
+    }
+
+    private func importWatermarkImage() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.png, .jpeg, .tiff, .heic]
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url, let data = try? Data(contentsOf: url) {
+            var wm = model.watermark
+            wm.imageData = data
+            wm.text = ""
+            model.updateWatermark(wm)
+            model.log("已导入水印图片: \(url.lastPathComponent)")
         }
     }
 
@@ -1096,6 +1291,12 @@ struct ContentView: View {
                 Text(String(format: "%.2f", model.speechRate)).font(.caption.monospacedDigit())
             }
             Slider(value: $model.speechRate, in: 0.2...0.6, step: 0.05)
+            HStack {
+                Text("停顿感").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Text(String(format: "%.1f×", model.pauseScale)).font(.caption.monospacedDigit())
+            }
+            Slider(value: $model.pauseScale, in: 0...2, step: 0.1)
         }
     }
 
