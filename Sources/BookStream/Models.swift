@@ -100,8 +100,13 @@ public enum TextProcessor {
         splitSentencesWithPauses(text).map { $0.text }
     }
 
-    /// 分句并标注句后停顿（秒）：空行后的段落末尾 0.7s，普通句末 0.25s。
+    /// 分句并标注句后停顿（秒）：空行后的段落末尾 1.0s，普通句末 0.4s。
+    /// 停顿感明显（配合“停顿感”滑块 0~2 倍），营造真人朗读节奏。
+    /// 先统一换行符（\r\n / \r → \n），保证 Windows 换行的文本也能识别空行段落。
     public static func splitSentencesWithPauses(_ text: String) -> [(text: String, pauseAfter: Double)] {
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
         var sentences: [(text: String, pauseAfter: Double)] = []
         var current = ""
         var pendingTerminator = ""
@@ -112,19 +117,19 @@ public enum TextProcessor {
             let s = (current + pendingTerminator)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if !s.isEmpty {
-                sentences.append((s, 0.25))
+                sentences.append((s, 0.4))
                 lastFlushedIndex = sentences.count - 1
             }
             current = ""
             pendingTerminator = ""
         }
 
-        for ch in text {
+        for ch in normalized {
             if ch == "\n" {
                 if current.isEmpty && pendingTerminator.isEmpty {
                     // 空行 → 上一句是段落末尾
                     if let idx = lastFlushedIndex {
-                        sentences[idx].pauseAfter = 0.7
+                        sentences[idx].pauseAfter = 1.0
                     }
                     continue
                 }

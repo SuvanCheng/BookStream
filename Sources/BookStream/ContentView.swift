@@ -70,7 +70,6 @@ final class AppModel: ObservableObject {
     @Published var exportMode: ExportMode = .video
     @Published var highlightColor: CaptionColor = .vividOrange
     @Published var videoResolution: VideoResolution = .p1080
-    @Published var scrollStrength: Double = 0.5   // 变速强度：句内滚动速度变化幅度 0...1
 
     // 本地 AI 音色（Piper）
     @Published var piperModels: [PiperVoice] = []
@@ -274,12 +273,13 @@ final class AppModel: ObservableObject {
     /// 试听当前选中的 AI 音色（本地合成一句样例并播放）。
     func previewPiperVoice() {
         guard piperEngineInstalled, let voice = selectedPiperVoice else { return }
+        let rate = speechRate
         log("正在合成 AI 试听（\(voice.displayName) · \(voice.language)）...")
         Task.detached(priority: .userInitiated) {
             do {
                 let buffers = try PiperTTS().render(
                     text: "This is a preview of the local AI voice. 你好，这是本地 AI 音色的试听。",
-                    voice: voice, rate: 0.5
+                    voice: voice, rate: rate
                 )
                 let tmp = FileManager.default.temporaryDirectory
                     .appendingPathComponent("piper-preview-\(UUID().uuidString).wav")
@@ -388,7 +388,7 @@ final class AppModel: ObservableObject {
         guard !isModelDownloading else { return }
         isModelDownloading = true
         let quality = piperQuality.rawValue
-        log("正在下载 AI 音色 \(language)-\(dataset)-\(quality)（约 20~60MB，一次性；若该档位不存在会自动回退到更低档）...")
+        log("正在下载 AI 音色 \(language)-\(dataset)-\(quality)（约 20~125MB，一次性；若该档位不存在会自动回退到更低档）...")
         // 优先用目录规范路径（含语言族前缀），目录未加载时才回退到按语言-数据集拼的旧路径。
         let catalogEntry = piperCatalog.first { $0.id == "\(language)-\(dataset)" }
         Task.detached(priority: .userInitiated) {
@@ -655,7 +655,7 @@ final class AppModel: ObservableObject {
                     audioURL: tmpWAV,
                     segments: result.segments,
                     outputURL: mp4URL,
-                    style: CaptionStyle(highlight: highlightColor, scrollStrength: scrollStrength),
+                    style: CaptionStyle(highlight: highlightColor),
                     resolution: videoResolution,
                     watermark: watermark,
                     progress: { [weak self] p in
@@ -711,7 +711,7 @@ final class AppModel: ObservableObject {
                         audioURL: companion,
                         segments: segments,
                         outputURL: mp4URL,
-                        style: CaptionStyle(highlight: highlightColor, scrollStrength: scrollStrength),
+                        style: CaptionStyle(highlight: highlightColor),
                         resolution: videoResolution,
                         watermark: watermark,
                         progress: { [weak self] p in
@@ -743,7 +743,7 @@ final class AppModel: ObservableObject {
                         audioURL: tmpWAV,
                         segments: result.segments,
                         outputURL: mp4URL,
-                        style: CaptionStyle(highlight: highlightColor, scrollStrength: scrollStrength),
+                        style: CaptionStyle(highlight: highlightColor),
                         resolution: videoResolution,
                         watermark: watermark,
                         progress: { [weak self] p in
@@ -842,6 +842,9 @@ final class AppModel: ObservableObject {
 
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
+    // 左侧控制区滚动状态（可滚动区 0...1 的进度 + 是否溢出需要滚动条）
+    @State private var leftScrollFraction: Double = 0
+    @State private var leftScrollHasOverflow: Bool = false
 
     var body: some View {
         HSplitView {
@@ -868,6 +871,25 @@ struct ContentView: View {
     // MARK: 左侧面板
 
     private var leftPanel: some View {
+        VStack(spacing: 0) {
+            LeftScrollHost(
+                scrollFraction: $leftScrollFraction,
+                hasOverflow: $leftScrollHasOverflow
+            ) {
+                leftScrollContent
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // 底部滚动进度条：拖动可定位窗口高度被裁掉的左栏控件
+            if leftScrollHasOverflow {
+                leftScrollProgressBar
+            }
+        }
+        .padding(.top, 16)
+        .task { model.refreshPiper() }
+    }
+
+    /// 左栏可滚动内容（窗口高度不足时用进度条上下滚动定位下方被隐藏的控件）。
+    private var leftScrollContent: some View {
         VStack(alignment: .leading, spacing: 14) {
             dropZone
             infoBox
@@ -889,8 +911,6 @@ struct ContentView: View {
                 }
             }
             actionButtons
-            Spacer(minLength: 0)
-            // 左下角版本信息（辅助判断是否最新版），负偏移贴近真正的左下角
             HStack {
                 Text(Self.versionString)
                     .font(.caption2)
@@ -898,10 +918,19 @@ struct ContentView: View {
                     .lineLimit(1)
                 Spacer()
             }
-            .offset(x: -10, y: 15)
         }
-        .padding(16)
-        .task { model.refreshPiper() }
+        .padding([.leading, .trailing], 16)
+        .padding(.bottom, 10)
+    }
+
+    private var leftScrollProgressBar: some View {
+        ScrollProgressBar(
+            fraction: Binding(
+                get: { leftScrollFraction },
+                set: { leftScrollFraction = min(max($0, 0), 1) }
+            )
+        )
+        .frame(height: 24)
     }
 
     /// 本地 AI 音色（Piper）选择与安装。
@@ -1102,27 +1131,26 @@ struct ContentView: View {
                         .onTapGesture { model.highlightColor = c }
                 }
             }
-            HStack {
-                Text("变速强度").font(.caption).foregroundStyle(.secondary)
-                Text("0（匀速）").font(.caption2).foregroundStyle(.tertiary)
-                Slider(value: $model.scrollStrength, in: 0...1)
-                Text("1（缓动）").font(.caption2).foregroundStyle(.tertiary)
-            }
         }
+    }
+
+    /// 水印某字段的可写绑定：改动即整体更新并持久化。
+    private func wmBinding<Value>(_ keyPath: WritableKeyPath<WatermarkSettings, Value>) -> Binding<Value> {
+        Binding(
+            get: { model.watermark[keyPath: keyPath] },
+            set: { newValue in
+                var wm = model.watermark
+                wm[keyPath: keyPath] = newValue
+                model.updateWatermark(wm)
+            }
+        )
     }
 
     /// 水印（文本/图片，位置/大小/透明度可调）。
     private var watermarkSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Toggle("水印", isOn: Binding(
-                get: { model.watermark.enabled },
-                set: { on in
-                    var wm = model.watermark
-                    wm.enabled = on
-                    model.updateWatermark(wm)
-                }
-            ))
-            .font(.caption)
+            Toggle("水印", isOn: wmBinding(\.enabled))
+                .font(.caption)
 
             if model.watermark.enabled {
                 Picker("类型", selection: Binding(
@@ -1141,12 +1169,9 @@ struct ContentView: View {
 
                 if model.watermark.imageData == nil {
                     HStack {
-                        TextField("水印文本", text: Binding(
-                            get: { model.watermark.text },
-                            set: { var wm = model.watermark; wm.text = $0; model.updateWatermark(wm) }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-                        .font(.caption)
+                        TextField("水印文本", text: wmBinding(\.text))
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption)
                         Button("导入图片") { importWatermarkImage() }
                             .font(.caption)
                     }
@@ -1158,23 +1183,15 @@ struct ContentView: View {
                                 .frame(width: 14, height: 14)
                                 .overlay(Circle().stroke(model.watermark.color == c ? Color.primary : Color.clear, lineWidth: 2))
                                 .contentShape(Circle())
-                                .onTapGesture {
-                                    var wm = model.watermark
-                                    wm.color = c
-                                    model.updateWatermark(wm)
-                                }
+                                .onTapGesture { wmBinding(\.color).wrappedValue = c }
                         }
                     }
                 } else {
                     HStack {
                         Text("已导入图片水印").font(.caption).foregroundStyle(.secondary)
                         Spacer()
-                        Button("清除") {
-                            var wm = model.watermark
-                            wm.imageData = nil
-                            model.updateWatermark(wm)
-                        }
-                        .font(.caption)
+                        Button("清除") { wmBinding(\.imageData).wrappedValue = nil }
+                            .font(.caption)
                     }
                 }
 
@@ -1182,17 +1199,14 @@ struct ContentView: View {
                     Text(model.watermark.imageData == nil ? "字号" : "大小").font(.caption).foregroundStyle(.secondary)
                     Slider(
                         value: model.watermark.imageData == nil
-                            ? Binding(get: { model.watermark.fontSize }, set: { var wm = model.watermark; wm.fontSize = $0; model.updateWatermark(wm) })
-                            : Binding(get: { model.watermark.imageScale }, set: { var wm = model.watermark; wm.imageScale = $0; model.updateWatermark(wm) }),
+                            ? wmBinding(\.fontSize)
+                            : wmBinding(\.imageScale),
                         in: model.watermark.imageData == nil ? 16...72 : 0.05...0.4
                     )
                 }
                 HStack {
                     Text("位置").font(.caption).foregroundStyle(.secondary)
-                    Picker("位置", selection: Binding(
-                        get: { model.watermark.position },
-                        set: { var wm = model.watermark; wm.position = $0; model.updateWatermark(wm) }
-                    )) {
+                    Picker("位置", selection: wmBinding(\.position)) {
                         ForEach(WatermarkSettings.Position.allCases) { p in
                             Text(p.label).tag(p)
                         }
@@ -1201,10 +1215,7 @@ struct ContentView: View {
                 }
                 HStack {
                     Text("透明度").font(.caption).foregroundStyle(.secondary)
-                    Slider(value: Binding(
-                        get: { model.watermark.opacity },
-                        set: { var wm = model.watermark; wm.opacity = $0; model.updateWatermark(wm) }
-                    ), in: 0.05...1.0)
+                    Slider(value: wmBinding(\.opacity), in: 0.05...1.0)
                 }
             }
         }
@@ -1214,12 +1225,16 @@ struct ContentView: View {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.png, .jpeg, .tiff, .heic]
         panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url, let data = try? Data(contentsOf: url) {
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let data = try Data(contentsOf: url)
             var wm = model.watermark
             wm.imageData = data
             wm.text = ""
             model.updateWatermark(wm)
             model.log("已导入水印图片: \(url.lastPathComponent)")
+        } catch {
+            model.log("导入水印图片失败: \(error.localizedDescription)")
         }
     }
 
@@ -1291,12 +1306,15 @@ struct ContentView: View {
                 Text(String(format: "%.2f", model.speechRate)).font(.caption.monospacedDigit())
             }
             Slider(value: $model.speechRate, in: 0.2...0.6, step: 0.05)
-            HStack {
-                Text("停顿感").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Text(String(format: "%.1f×", model.pauseScale)).font(.caption.monospacedDigit())
+            // 停顿感只对「书」输入生效（renderBook 按句插入停顿；字幕模式由时间轴决定，无此参数）
+            if case .book = model.inputKind {
+                HStack {
+                    Text("停顿感").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Text(String(format: "%.1f×", model.pauseScale)).font(.caption.monospacedDigit())
+                }
+                Slider(value: $model.pauseScale, in: 0...2, step: 0.1)
             }
-            Slider(value: $model.pauseScale, in: 0...2, step: 0.1)
         }
     }
 
@@ -1454,5 +1472,212 @@ struct PlayerView: NSViewRepresentable {
         if currentURL != url {
             nsView.player = AVPlayer(url: url)
         }
+    }
+}
+
+// MARK: - 左侧控制区可滚动容器
+//
+// 左栏内容较多，当全局窗口高度小于内容高度时，下方的控制按钮会被裁掉而无法访问。
+// 这里用 NSScrollView 桥接：自带原生系统滚动条（滚轮/两指可滚），同时把滚动进度
+// （0...1）暴露给 SwiftUI，配合左下角的可拖动进度条，可直观定位被隐藏的控件。
+
+/// 跟随窗口宽度横向贴合、纵向可滚动的 NSScrollView。
+@MainActor
+private final class LeftFittingScrollView: NSScrollView {
+    override func layout() {
+        super.layout()
+        guard let doc = documentView else { return }
+        let clipW = contentView.bounds.width
+        var f = doc.frame
+        f.size.width = clipW
+        if f.size.height < contentView.bounds.height {
+            f.size.height = contentView.bounds.height
+        }
+        doc.frame = f
+    }
+}
+
+/// 左栏滚动容器的协调器：持有 NSScrollView + NSHostingController，负责把滚动进度
+/// 双向同步到 SwiftUI（滚轮滚动→上报进度；拖动进度条→按进度滚动），并上报是否溢出。
+@MainActor
+private final class LeftScrollCoordinator: NSObject {
+    let scrollView = LeftFittingScrollView()
+    let controller = NSHostingController(rootView: AnyView(EmptyView()))
+    /// 直接写回 SwiftUI 绑定（滚动进度 0...1 / 是否溢出）。
+    var onFractionWriteBack: ((Double) -> Void)?
+    var onOverflowWriteBack: ((Bool) -> Void)?
+    /// 上次应用（由进度条驱动）的进度，用于抑制回环。
+    var lastAppliedFraction: Double?
+    var lastReportedFraction: Double?
+    var lastReportedOverflow: Bool?
+
+    override init() {
+        super.init()
+        let sv = scrollView
+        sv.hasVerticalScroller = true
+        sv.hasHorizontalScroller = false
+        sv.autohidesScrollers = true
+        sv.scrollerStyle = .overlay
+        sv.drawsBackground = false
+        sv.borderType = .noBorder
+        sv.documentView = controller.view
+        sv.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(boundsDidChange(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: sv.contentView
+        )
+    }
+
+    @objc private func boundsDidChange(_ note: Notification) {
+        if let doc = scrollView.documentView {
+            var f = doc.frame
+            f.size.width = scrollView.contentView.bounds.width
+            doc.frame = f
+        }
+        refreshMetrics()
+    }
+
+    /// 计算当前滚动进度（0...1）与是否溢出，并回调给 SwiftUI。
+    func refreshMetrics(force: Bool = false) {
+        controller.view.layoutSubtreeIfNeeded()
+        let clipH = scrollView.contentView.bounds.height
+        let docH = controller.view.fittingSize.height
+        // 显式把文档高度设为内容自然高度（≥ 可视区），保证内容超出时真正可滚动。
+        if let doc = scrollView.documentView {
+            var f = doc.frame
+            f.size.width = scrollView.contentView.bounds.width
+            f.size.height = max(docH, clipH)
+            doc.frame = f
+        }
+        // 让 NSScrollView 按新文档尺寸重算滚动范围。
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        let maxScroll = max(docH - clipH, 0)
+        let overflow = maxScroll > 1
+        if overflow != lastReportedOverflow || force {
+            lastReportedOverflow = overflow
+            onOverflowWriteBack?(overflow)
+        }
+        let fr: Double = maxScroll > 0 ? Double(scrollView.contentView.bounds.origin.y / maxScroll) : 0
+        let clamped = min(max(fr, 0), 1)
+        if abs(clamped - (lastReportedFraction ?? -1)) > 0.0005 || force {
+            lastReportedFraction = clamped
+            onFractionWriteBack?(clamped)
+        }
+    }
+
+    /// 把内容视图及其滚动文档刷新为给定 SwiftUI 内容。
+    func setContent<Content: View>(_ content: Content) {
+        controller.rootView = AnyView(content)
+        controller.view.layoutSubtreeIfNeeded()
+        if let doc = scrollView.documentView {
+            var f = doc.frame
+            f.size.width = scrollView.contentView.bounds.width
+            doc.frame = f
+        }
+        refreshMetrics(force: true)
+    }
+
+    /// 按目标进度滚动（由底部进度条拖动触发）。
+    func applyFraction(_ target: Double) {
+        let clamped = min(max(target, 0), 1)
+        // 若与当前实际进度一致则跳过，避免回环。
+        refreshMetrics()
+        if abs(clamped - (lastReportedFraction ?? -1)) < 0.0005 {
+            lastAppliedFraction = clamped
+            return
+        }
+        let clipH = scrollView.contentView.bounds.height
+        let docH = controller.view.frame.height
+        let maxScroll = max(docH - clipH, 0)
+        lastAppliedFraction = clamped
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: clamped * maxScroll))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+}
+
+/// 把左栏内容包进可滚动区域，并向 SwiftUI 暴露滚动进度（0...1）与是否溢出。
+private struct LeftScrollHost<Content: View>: NSViewRepresentable {
+    @Binding var scrollFraction: Double
+    @Binding var hasOverflow: Bool
+    let content: Content
+    /// 绑定句柄（指向 @State 真实存储，供权威侧写回）。
+    private let fractionBinding: Binding<Double>
+    private let overflowBinding: Binding<Bool>
+
+    init(
+        scrollFraction: Binding<Double>,
+        hasOverflow: Binding<Bool>,
+        @ViewBuilder content: () -> Content
+    ) {
+        self._scrollFraction = scrollFraction
+        self._hasOverflow = hasOverflow
+        self.fractionBinding = scrollFraction
+        self.overflowBinding = hasOverflow
+        self.content = content()
+    }
+
+    func makeCoordinator() -> LeftScrollCoordinator { LeftScrollCoordinator() }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        context.coordinator.scrollView
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        let coordinator = context.coordinator
+        // 滚动进度 / 溢出直接写回 @State 真实存储（主线程自动，无回环：同值不重复应用）。
+        coordinator.onFractionWriteBack = { [fractionBinding] fr in
+            fractionBinding.wrappedValue = fr
+        }
+        coordinator.onOverflowWriteBack = { [overflowBinding] ov in
+            overflowBinding.wrappedValue = ov
+        }
+        // 内容更新（左栏全部控件 + 版本号）。
+        coordinator.setContent(content)
+        // 若底部进度条拖动改变了进度，则按目标滚动。
+        let target = scrollFraction
+        if abs(target - (coordinator.lastAppliedFraction ?? -1)) > 0.0005 {
+            coordinator.applyFraction(target)
+        }
+    }
+}
+
+/// 左栏底部的滚动进度条：Thumb 反映当前滚动进度，拖动即把左栏滚到对应位置，
+/// 用于定位窗口高度不足、被裁掉的隐藏控件。
+private struct ScrollProgressBar: View {
+    @Binding var fraction: Double
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+            let thumb: CGFloat = 26
+            let travel = max(width - thumb, 1)
+            let x = CGFloat(fraction) * travel
+            ZStack(alignment: .leading) {
+                // 轨道
+                Capsule()
+                    .fill(Color.primary.opacity(0.08))
+                    .frame(height: 6)
+                    .frame(maxHeight: .infinity)
+                // Thumb
+                Capsule()
+                    .fill(Color.accentColor.opacity(0.75))
+                    .frame(width: thumb, height: 6)
+                    .offset(x: x)
+            }
+            .frame(height: 26, alignment: .center)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        let clamped = min(max((v.location.x - thumb / 2) / travel, 0), 1)
+                        fraction = Double(clamped)
+                    }
+            )
+        }
+        .frame(height: 26)
+        .padding(.horizontal, 16)
+        .accessibilityLabel("左侧控制区滚动进度")
     }
 }

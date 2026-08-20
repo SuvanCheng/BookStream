@@ -77,7 +77,9 @@ enum SelfTest {
             case "txt", "epub":
                 let sentences = try TextProcessor.parseBookFile(url: url)
                 let chars = sentences.reduce(0) { $0 + $1.text.count }
-                print("PARSE OK [\(ext)]: \(sentences.count) 句, \(chars) 字")
+                let paraPauses = sentences.filter { $0.pauseAfter >= 1.0 }.count
+                let sentPauses = sentences.filter { $0.pauseAfter > 0 && $0.pauseAfter < 1.0 }.count
+                print("PARSE OK [\(ext)]: \(sentences.count) 句, \(chars) 字（段末停顿 \(paraPauses) 处 · 句末停顿 \(sentPauses) 处）")
                 print("  first: \(sentences.first?.text.prefix(80) ?? "")")
             case "srt":
                 let entries = try SrtParser.parse(url: url)
