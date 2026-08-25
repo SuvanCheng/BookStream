@@ -89,6 +89,9 @@ final class AppModel: ObservableObject {
     // 水印（视频导出用，UserDefaults 持久化）
     @Published var watermark: WatermarkSettings = AppModel.loadWatermark()
 
+    // 中英双语字幕配置（UserDefaults 持久化）
+    @Published var translationSettings: TranslationSettings = AppModel.loadTranslationSettings()
+
     // 运行状态
     @Published var isProcessing = false
     @Published var progress: Double = 0
@@ -120,7 +123,9 @@ final class AppModel: ObservableObject {
             return "\(title) · \(sentences.count) 句 · \(chars) 字 · 音频约 \(Self.formatDuration(audioEst)) · 生成约 \(Self.formatDuration(genEst))"
         case .subtitles(let title, let entries):
             let dur = entries.last.map { $0.end } ?? 0
-            return "\(title) · \(entries.count) 条 · 总时长 \(Self.formatDuration(dur))"
+            let isBilingual = entries.contains { $0.translation != nil && !$0.translation!.isEmpty }
+            let tag = isBilingual ? " · 中英双语" : ""
+            return "\(title) · \(entries.count) 条\(tag) · 总时长 \(Self.formatDuration(dur))"
         }
     }
 
@@ -421,7 +426,12 @@ final class AppModel: ObservableObject {
                     title: url.deletingPathExtension().lastPathComponent,
                     entries: entries
                 )
-                log("SRT 解析完成: \(entries.count) 条（\(String(format: "%.2f", Date().timeIntervalSince(t0)))s）")
+                let bilingualCount = entries.filter { $0.translation != nil && !$0.translation!.isEmpty }.count
+                if bilingualCount > 0 {
+                    log("SRT 解析完成: \(entries.count) 条（自动识别中英双语 \(bilingualCount) 条，耗时 \(String(format: "%.2f", Date().timeIntervalSince(t0)))s）")
+                } else {
+                    log("SRT 解析完成: \(entries.count) 条（\(String(format: "%.2f", Date().timeIntervalSince(t0)))s）")
+                }
             case "ass", "ssa":
                 let entries = try await Task.detached(priority: .userInitiated) {
                     try AssParser.parse(url: url)
@@ -691,7 +701,27 @@ final class AppModel: ObservableObject {
 
         do {
             switch (input, exportMode) {
-            case (.book(_, let sentences), let mode):
+            case (.book(_, let rawSentences), let mode):
+                var sentences = rawSentences
+                if translationSettings.enabled {
+                    let toTrCount = sentences.filter { ($0.translation?.isEmpty ?? true) && TextProcessor.isPrimarilyEnglish($0.text) }.count
+                    if toTrCount > 0 {
+                        log("正在执行中英双语智能文学翻译（\(translationSettings.provider.displayName)，待翻译 \(toTrCount) 句）...")
+                        let trStart = Date()
+                        sentences = try await Translator.translateBook(
+                            sentences: sentences,
+                            settings: translationSettings,
+                            onProgress: { [weak self] done, total in
+                                Task { @MainActor [weak self] in
+                                    self?.updateProgress(Double(done) / Double(max(total, 1)), text: "双语翻译 \(done)/\(total) 句")
+                                }
+                            },
+                            cancellation: cancelled
+                        )
+                        log("中英双语翻译完成（共 \(sentences.count) 句，耗时 \(String(format: "%.1f", Date().timeIntervalSince(trStart)))s）")
+                    }
+                }
+
                 let chapterRanges = TextProcessor.detectChaptersFromSentences(sentences: sentences)
                 if exportByChapter && chapterRanges.count > 1 {
                     log("已检测到 \(chapterRanges.count) 个章节，正在按章节分卷导出...")
@@ -816,6 +846,7 @@ final class AppModel: ObservableObject {
                         TimedSegment(
                             id: $0.id,
                             text: $0.text,
+                            translation: $0.translation,
                             startFrame: Int64(($0.start * AudioFormat.sampleRate).rounded()),
                             endFrame: Int64(($0.end * AudioFormat.sampleRate).rounded())
                         )
@@ -1173,6 +1204,43 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private static func loadTranslationSettings() -> TranslationSettings {
+        guard let data = UserDefaults.standard.data(forKey: "BookStream.translationSettings"),
+              let ts = try? JSONDecoder().decode(TranslationSettings.self, from: data) else {
+            return .default
+        }
+        return ts
+    }
+
+    /// 更新翻译配置并持久化。
+    func saveTranslationSettings() {
+        if let data = try? JSONEncoder().encode(translationSettings) {
+            UserDefaults.standard.set(data, forKey: "BookStream.translationSettings")
+        }
+    }
+
+    /// 测试大模型翻译连接
+    func testTranslation() {
+        let settings = translationSettings
+        log("正在测试翻译连接（\(settings.provider.displayName)）...")
+        Task.detached(priority: .userInitiated) {
+            do {
+                let sample = try await Translator.testConnection(settings: settings)
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self.log("✅ 翻译连接成功！译文样例: 「\(sample)」")
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self.log("❌ 翻译连接失败: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
+
     /// 应用版本号（唯一代码侧出处）：优先取 Bundle（由 build.sh 打包写入），
     /// 无 Bundle（纯命令行模式）时回退默认。升级版本号改 build.sh 的 CFBundleShortVersionString 即可。
     static let appVersion: String = {
@@ -1255,6 +1323,7 @@ struct ContentView: View {
             Divider()
             unifiedVoiceSection
             rateSlider
+            bilingualSection
             bgmSection
             Divider()
             modePicker
@@ -1497,6 +1566,86 @@ struct ContentView: View {
         }
         .padding(8)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+    }
+
+    /// 中英双语字幕控制面板
+    private var bilingualSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("生成中英双语字幕（声音英文·双语显示）", isOn: Binding(
+                get: { model.translationSettings.enabled },
+                set: { model.translationSettings.enabled = $0; model.saveTranslationSettings() }
+            ))
+            .font(.caption.weight(.medium))
+
+            if model.translationSettings.enabled {
+                VStack(alignment: .leading, spacing: 6) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("AI 翻译大模型").font(.caption).foregroundStyle(.secondary)
+                        Picker("翻译引擎", selection: Binding(
+                            get: { model.translationSettings.provider },
+                            set: { newP in
+                                model.translationSettings.provider = newP
+                                model.translationSettings.endpointURL = newP.defaultEndpoint
+                                model.translationSettings.model = newP.defaultModel
+                                model.saveTranslationSettings()
+                            }
+                        )) {
+                            ForEach(TranslationProvider.allCases) { p in
+                                Text(p.displayName).tag(p)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+
+                    if model.translationSettings.provider != .builtInFree {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("接口端点 URL (Endpoint)").font(.caption).foregroundStyle(.secondary)
+                            TextField("https://api.deepseek.com/chat/completions 或 http://127.0.0.1:8000/v1/chat/completions", text: Binding(
+                                get: { model.translationSettings.endpointURL },
+                                set: { model.translationSettings.endpointURL = $0; model.saveTranslationSettings() }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption)
+                        }
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(model.translationSettings.provider == .custom ? "API Key (本地 rapid-mlx 可留空)" : "API Key (sk-...)").font(.caption).foregroundStyle(.secondary)
+                            SecureField(model.translationSettings.provider == .custom ? "可选 / 无需密钥可留空" : "sk-...", text: Binding(
+                                get: { model.translationSettings.apiKey },
+                                set: { model.translationSettings.apiKey = $0; model.saveTranslationSettings() }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption)
+                        }
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("模型名称 (Model)").font(.caption).foregroundStyle(.secondary)
+                            TextField("deepseek-chat / default", text: Binding(
+                                get: { model.translationSettings.model },
+                                set: { model.translationSettings.model = $0; model.saveTranslationSettings() }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption)
+                        }
+                    }
+
+                    HStack {
+                        Text(model.translationSettings.provider == .custom ? "💡 完美支持本地 rapid-mlx / MLX 推理服务" : (model.translationSettings.provider == .deepseek ? "💡 DeepSeek 官方 API · 文学典雅" : "💡 免配置即开即用"))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("测试连接") {
+                            model.testTranslation()
+                        }
+                        .font(.caption)
+                    }
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.06)))
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
     }
 
     private var colorPalette: some View {

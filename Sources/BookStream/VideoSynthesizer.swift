@@ -558,7 +558,8 @@ public final class VideoRenderer: @unchecked Sendable {
         let speed = CGFloat(style.scrollSpeed) * scale
         let halfWindow: CGFloat = CGFloat(height) * 0.55
         let rangeSeconds = Double(halfWindow) / Double(max(speed, 1))
-        let minGap: CGFloat = 22 * scale
+        let hasBilingual = sortedSegments.contains { $0.translation != nil && !$0.translation!.isEmpty }
+        let minGap: CGFloat = (hasBilingual ? 52 : 22) * scale
         let layouts = precomputeLayouts(segments: sortedSegments, style: style, scale: scale, maxWidth: maxWidth)
         let audioSpectrum = style.showVisualizer ? Self.extractAudioSpectrum(from: audioURL) : []
         let spectrumBox = UncheckedSendableBox(audioSpectrum)
@@ -800,22 +801,48 @@ public final class VideoRenderer: @unchecked Sendable {
         maxWidth: CGFloat
     ) -> [LineLayout] {
         let fontHighlight = Self.makeFont(named: style.font, size: 72 * scale, weight: .bold)
+        let fontHighlightSub = Self.makeFont(named: style.font, size: 46 * scale, weight: .medium)
         let fontNormal = Self.makeFont(named: style.font, size: 44 * scale, weight: .regular)
+        let fontNormalSub = Self.makeFont(named: style.font, size: 28 * scale, weight: .regular)
+
         let fontHighlightBox = UncheckedSendableBox(fontHighlight)
+        let fontHighlightSubBox = UncheckedSendableBox(fontHighlightSub)
         let fontNormalBox = UncheckedSendableBox(fontNormal)
+        let fontNormalSubBox = UncheckedSendableBox(fontNormalSub)
+
         let colorHighlightBox = UncheckedSendableBox(style.highlight.nsColor)
         let colorNormalBox = UncheckedSendableBox(style.normal.nsColor)
+        let colorSubNormalBox = UncheckedSendableBox(style.normal.nsColor.withAlphaComponent(0.78))
+        let colorSubCurrentBox = UncheckedSendableBox(NSColor(calibratedRed: 0.90, green: 0.90, blue: 0.92, alpha: 0.88))
 
         // 生成 3 种排版：
-        // 0: 普通字号（44pt）
-        // 1: 居中当前句底色（72pt，白/微透色）
-        // 2: 居中当前句高亮色（72pt，highlightColor）
+        // 0: 普通字号（44pt 主行 + 28pt 译文）
+        // 1: 居中当前句底色（72pt 主行 + 46pt 译文，白/微透色）
+        // 2: 居中当前句高亮色（72pt 主行高亮色 + 46pt 译文优雅白）
         let box = ConcurrentBufferBox<LineLayout>(count: segments.count * 3)
         DispatchQueue.concurrentPerform(iterations: segments.count) { i in
-            let text = segments[i].text
-            let norm = makeLineLayout(text: text, font: fontNormalBox.value, color: colorNormalBox.value, maxWidth: maxWidth)
-            let baseCurrent = makeLineLayout(text: text, font: fontHighlightBox.value, color: colorNormalBox.value.withAlphaComponent(0.85), maxWidth: maxWidth)
-            let highCurrent = makeLineLayout(text: text, font: fontHighlightBox.value, color: colorHighlightBox.value, maxWidth: maxWidth)
+            let seg = segments[i]
+            let norm = makeLineLayout(
+                text: seg.text,
+                translation: seg.translation,
+                font: fontNormalBox.value,
+                subFont: fontNormalSubBox.value,
+                color: colorNormalBox.value,
+                subColor: colorSubNormalBox.value,
+                scale: scale,
+                maxWidth: maxWidth
+            )
+            let (baseCurrent, highCurrent) = makeLineLayoutPair(
+                text: seg.text,
+                translation: seg.translation,
+                font: fontHighlightBox.value,
+                subFont: fontHighlightSubBox.value,
+                baseColor: colorNormalBox.value.withAlphaComponent(0.85),
+                highColor: colorHighlightBox.value,
+                subColor: colorSubCurrentBox.value,
+                scale: scale,
+                maxWidth: maxWidth
+            )
             box[i * 3 + 0] = norm
             box[i * 3 + 1] = baseCurrent
             box[i * 3 + 2] = highCurrent
@@ -878,37 +905,37 @@ public final class VideoRenderer: @unchecked Sendable {
             (heights[a - lo] + heights[b - lo]) / 2 + minGap
         }
 
-        // ---- 3. 定位（坐标系：y 向上为正，y=0 底边、y=H 顶边；当前句支持切句缓动）----
+        // ---- 3. 定位（坐标系：y 向上为正，y=0 底边、y=H 顶边；macOS 连续流体缓动）----
         var yCenter = [CGFloat?](repeating: nil, count: hi - lo)
+        let easeDuration = 0.42
 
         if let ci = currentIdx {
             let seg = segments[ci]
             let dt = time - seg.start
-            let easeDuration = 0.32
             let targetY = centerY
-            let rawY = centerY - CGFloat(seg.start - time) * speed
+            
             let anchorY: CGFloat
             if dt < easeDuration && dt >= 0 {
                 let u = CGFloat(dt / easeDuration)
-                let ease = 1.0 - (1.0 - u) * (1.0 - u) * (1.0 - u) // cubic ease-out
-                anchorY = rawY + (targetY - rawY) * ease
+                let p = 1.0 - pow(1.0 - u, 4) // Quartic ease-out
+                let prevGap = ci > lo ? spacing(ci - 1, ci) : spacing(ci, ci)
+                let startY = targetY - prevGap
+                anchorY = startY + (targetY - startY) * p
             } else {
                 anchorY = targetY
             }
             yCenter[ci - lo] = anchorY
 
-            // 历史（上方，y 更大）：从当前句向上约束
+            // 历史（上方，y 更大）：从当前句向上平滑约束
             if ci > lo {
                 for i in stride(from: ci - 1, through: lo, by: -1) {
-                    let raw = anchorY + CGFloat(time - segments[i].end) * speed
-                    yCenter[i - lo] = max(raw, yCenter[i + 1 - lo]! + spacing(i, i + 1))
+                    yCenter[i - lo] = yCenter[i + 1 - lo]! + spacing(i, i + 1)
                 }
             }
-            // 未来（下方，y 更小）：从当前句向下约束
+            // 未来（下方，y 更小）：从当前句向下平滑约束
             if ci + 1 < hi {
                 for i in (ci + 1)..<hi {
-                    let raw = anchorY - CGFloat(segments[i].start - time) * speed
-                    yCenter[i - lo] = min(raw, yCenter[i - 1 - lo]! - spacing(i - 1, i))
+                    yCenter[i - lo] = yCenter[i - 1 - lo]! - spacing(i - 1, i)
                 }
             }
         } else {
@@ -944,11 +971,13 @@ public final class VideoRenderer: @unchecked Sendable {
             }
         }
 
-        // ---- 4. 直接绘制 ----
+        // ---- 4. 直接绘制（支持 macOS 风格平滑放大/缩小与触感弹簧动效）----
         func drawLine(_ i: Int, isCurrent: Bool) {
             let seg = segments[i]
             guard let y = yCenter[i - lo] else { return }
             guard y > -320 * scale, y < canvas.height + 320 * scale else { return }
+
+            let baseRatio: CGFloat = 44.0 / 72.0 // 0.6111 常规与高亮字号比率
 
             if isCurrent {
                 let baseLayout = layouts[i * 3 + 1]
@@ -959,7 +988,31 @@ public final class VideoRenderer: @unchecked Sendable {
                 let roundedY = round(y - h / 2)
                 let rect = CGRect(x: roundedX, y: roundedY, width: w, height: h)
 
-                ctx.setAlpha(1.0)
+                // macOS 丝滑流体膨胀过渡（420ms Quartic 弹性缓入放大 + 微触感弹簧）
+                let dt = time - seg.start
+                let scaleFactor: CGFloat
+                let alpha: CGFloat
+                if dt < easeDuration && dt >= 0 {
+                    let u = CGFloat(dt / easeDuration)
+                    let p = 1.0 - pow(1.0 - u, 4)
+                    let spring = sin(u * .pi) * 0.035 * (1.0 - u) // 极细微触感弹性微呼吸
+                    scaleFactor = (baseRatio + (1.0 - baseRatio) * p) + spring
+                    alpha = 0.40 + (1.0 - 0.40) * p
+                } else {
+                    scaleFactor = 1.0
+                    alpha = 1.0
+                }
+
+                ctx.saveGState()
+                if abs(scaleFactor - 1.0) > 0.001 {
+                    let cx = roundedX + w / 2
+                    let cy = roundedY + h / 2
+                    ctx.translateBy(x: cx, y: cy)
+                    ctx.scaleBy(x: scaleFactor, y: scaleFactor)
+                    ctx.translateBy(x: -cx, y: -cy)
+                }
+                ctx.setAlpha(alpha)
+
                 if style.enableKaraoke {
                     // 1. 先绘制底色字形
                     ctx.draw(baseLayout.image, in: rect)
@@ -1001,25 +1054,54 @@ public final class VideoRenderer: @unchecked Sendable {
                 } else {
                     ctx.draw(highLayout.image, in: rect)
                 }
+                ctx.restoreGState()
             } else {
-                let layout = layouts[i * 3 + 0]
-                let alpha: CGFloat
-                if time < seg.start {
-                    let remaining = CGFloat(seg.start - time)
-                    alpha = min(1.0, max(0.35, 1.0 - remaining / 3.0 * 0.65))
+                let dtOut = time - seg.end
+                let outDuration = 0.38
+
+                if dtOut >= 0 && dtOut < outDuration {
+                    // 刚结束句：macOS 风格平滑缩小回落（380ms 缓出缩小）
+                    let highLayout = layouts[i * 3 + 2]
+                    let w = CGFloat(highLayout.image.width)
+                    let h = CGFloat(highLayout.image.height)
+                    let roundedX = round((canvas.width - w) / 2)
+                    let roundedY = round(y - h / 2)
+                    let rect = CGRect(x: roundedX, y: roundedY, width: w, height: h)
+
+                    let u = CGFloat(dtOut / outDuration)
+                    let p = 1.0 - pow(1.0 - u, 4)
+                    let scaleFactor = 1.0 - (1.0 - baseRatio) * p
+                    let alpha = 1.0 - (1.0 - 0.40) * p
+
+                    ctx.saveGState()
+                    let cx = roundedX + w / 2
+                    let cy = roundedY + h / 2
+                    ctx.translateBy(x: cx, y: cy)
+                    ctx.scaleBy(x: scaleFactor, y: scaleFactor)
+                    ctx.translateBy(x: -cx, y: -cy)
+                    ctx.setAlpha(alpha)
+                    ctx.draw(highLayout.image, in: rect)
+                    ctx.restoreGState()
                 } else {
-                    let age = CGFloat(time - seg.end)
-                    alpha = max(0.30, 1.0 - age / 5.0 * 0.70)
+                    let layout = layouts[i * 3 + 0]
+                    let alpha: CGFloat
+                    if time < seg.start {
+                        let remaining = CGFloat(seg.start - time)
+                        alpha = min(0.40, max(0.18, 1.0 - remaining / 3.0 * 0.82))
+                    } else {
+                        let age = CGFloat(time - seg.end)
+                        alpha = max(0.15, 0.40 - age / 5.0 * 0.25)
+                    }
+
+                    let w = CGFloat(layout.image.width)
+                    let h = CGFloat(layout.image.height)
+                    let roundedX = round((canvas.width - w) / 2)
+                    let roundedY = round(y - h / 2)
+                    let rect = CGRect(x: roundedX, y: roundedY, width: w, height: h)
+
+                    ctx.setAlpha(alpha)
+                    ctx.draw(layout.image, in: rect)
                 }
-
-                let w = CGFloat(layout.image.width)
-                let h = CGFloat(layout.image.height)
-                let roundedX = round((canvas.width - w) / 2)
-                let roundedY = round(y - h / 2)
-                let rect = CGRect(x: roundedX, y: roundedY, width: w, height: h)
-
-                ctx.setAlpha(alpha)
-                ctx.draw(layout.image, in: rect)
             }
         }
 
@@ -1033,22 +1115,174 @@ public final class VideoRenderer: @unchecked Sendable {
         return currentIdx != nil
     }
 
-    private func makeLineLayout(text: String, font: NSFont, color: NSColor, maxWidth: CGFloat) -> LineLayout {
-        let attr = NSMutableAttributedString(string: text, attributes: [
-            .font: font,
-            .foregroundColor: color,
-        ])
+    private func makeLineLayoutPair(
+        text: String,
+        translation: String?,
+        font: NSFont,
+        subFont: NSFont,
+        baseColor: NSColor,
+        highColor: NSColor,
+        subColor: NSColor,
+        scale: CGFloat,
+        maxWidth: CGFloat
+    ) -> (base: LineLayout, high: LineLayout) {
         let ps = NSMutableParagraphStyle()
         ps.alignment = .center
         ps.lineBreakMode = .byWordWrapping
-        attr.addAttribute(.paragraphStyle, value: ps, range: NSRange(location: 0, length: attr.length))
+        ps.lineSpacing = 5 * scale
+
+        let subPs = NSMutableParagraphStyle()
+        subPs.alignment = .center
+        subPs.lineBreakMode = .byWordWrapping
+        subPs.paragraphSpacingBefore = 12 * scale
+
+        let primaryCharCount = (text as NSString).length
+        let hasTranslation = (translation?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+
+        func buildAttr(mainCol: NSColor, subCol: NSColor) -> NSAttributedString {
+            let attr = NSMutableAttributedString()
+            let convertedMain = mainCol.usingColorSpace(.sRGB) ?? mainCol
+            let convertedSub = subCol.usingColorSpace(.sRGB) ?? subCol
+
+            attr.append(NSAttributedString(string: text, attributes: [
+                .font: font,
+                .foregroundColor: convertedMain,
+                .paragraphStyle: ps
+            ]))
+            if hasTranslation, let tr = translation?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                attr.append(NSAttributedString(string: "\n" + tr, attributes: [
+                    .font: subFont,
+                    .foregroundColor: convertedSub,
+                    .paragraphStyle: subPs
+                ]))
+            }
+            return attr
+        }
+
+        let baseAttr = buildAttr(mainCol: baseColor, subCol: subColor)
+        let highAttr = buildAttr(mainCol: highColor, subCol: subColor)
+
+        // 统一以 highAttr 进行几何度量，保证底图与高亮图尺寸 100% 相同、原点 0 偏移
+        let framesetter = CTFramesetterCreateWithAttributedString(highAttr)
+        let suggested = CTFramesetterSuggestFrameSizeWithConstraints(
+            framesetter,
+            CFRange(location: 0, length: 0),
+            nil,
+            CGSize(width: maxWidth, height: 2400),
+            nil
+        )
+        let w = max(1, Int(ceil(suggested.width)))
+        let h = max(1, Int(ceil(suggested.height)))
+
+        func renderVariant(attr: NSAttributedString) -> (CGImage, [SubLineInfo], Int) {
+            guard let ctx = CGContext(
+                data: nil,
+                width: w,
+                height: h,
+                bitsPerComponent: 8,
+                bytesPerRow: w * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+            ) else {
+                let fb = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)!
+                return (fb.makeImage()!, [], 1)
+            }
+            ctx.setAllowsAntialiasing(true)
+            ctx.setShouldAntialias(true)
+            ctx.setAllowsFontSmoothing(false)
+            ctx.setShouldSmoothFonts(false)
+            ctx.setAllowsFontSubpixelPositioning(true)
+            ctx.setShouldSubpixelPositionFonts(true)
+            ctx.setAllowsFontSubpixelQuantization(true)
+            ctx.setShouldSubpixelQuantizeFonts(true)
+
+            let fs = CTFramesetterCreateWithAttributedString(attr)
+            let path = CGPath(rect: CGRect(x: 0, y: 0, width: w, height: h), transform: nil)
+            let frame = CTFramesetterCreateFrame(fs, CFRange(location: 0, length: 0), path, nil)
+            CTFrameDraw(frame, ctx)
+
+            let ctLines = CTFrameGetLines(frame) as! [CTLine]
+            var origins = [CGPoint](repeating: .zero, count: ctLines.count)
+            CTFrameGetLineOrigins(frame, CFRange(location: 0, length: 0), &origins)
+
+            var subLines: [SubLineInfo] = []
+            var totalChars = 0
+            for (i, line) in ctLines.enumerated() {
+                let range = CTLineGetStringRange(line)
+                var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
+                let lineWidth = CTLineGetTypographicBounds(line, &ascent, &descent, &leading)
+                let lineX = origins[i].x
+                let pad = 4 * scale
+                let lineY = origins[i].y - descent - pad
+                let lineH = ascent + descent + pad * 2
+                let lineRect = CGRect(x: lineX, y: lineY, width: lineWidth, height: lineH)
+
+                if range.location < primaryCharCount {
+                    let endChar = min(primaryCharCount, range.location + range.length)
+                    subLines.append(SubLineInfo(rect: lineRect, startChar: range.location, endChar: endChar))
+                    totalChars = max(totalChars, endChar)
+                }
+            }
+            return (ctx.makeImage()!, subLines, max(1, totalChars > 0 ? totalChars : primaryCharCount))
+        }
+
+        let (baseImg, _, _) = renderVariant(attr: baseAttr)
+        let (highImg, subLines, totalChars) = renderVariant(attr: highAttr)
+
+        let baseLayout = LineLayout(image: baseImg, size: CGSize(width: CGFloat(w), height: CGFloat(h)), lines: subLines, totalChars: totalChars)
+        let highLayout = LineLayout(image: highImg, size: CGSize(width: CGFloat(w), height: CGFloat(h)), lines: subLines, totalChars: totalChars)
+        return (baseLayout, highLayout)
+    }
+
+    private func makeLineLayout(
+        text: String,
+        translation: String?,
+        font: NSFont,
+        subFont: NSFont,
+        color: NSColor,
+        subColor: NSColor,
+        scale: CGFloat,
+        maxWidth: CGFloat
+    ) -> LineLayout {
+        let attr = NSMutableAttributedString()
+
+        let ps = NSMutableParagraphStyle()
+        ps.alignment = .center
+        ps.lineBreakMode = .byWordWrapping
+        ps.lineSpacing = 5 * scale
+
+        let convertedColor = color.usingColorSpace(.sRGB) ?? color
+        let convertedSub = subColor.usingColorSpace(.sRGB) ?? subColor
+
+        let mainAttr = NSAttributedString(string: text, attributes: [
+            .font: font,
+            .foregroundColor: convertedColor,
+            .paragraphStyle: ps
+        ])
+        attr.append(mainAttr)
+
+        let primaryCharCount = (text as NSString).length
+
+        if let tr = translation?.trimmingCharacters(in: .whitespacesAndNewlines), !tr.isEmpty {
+            let subPs = NSMutableParagraphStyle()
+            subPs.alignment = .center
+            subPs.lineBreakMode = .byWordWrapping
+            subPs.paragraphSpacingBefore = 12 * scale
+
+            let subAttr = NSAttributedString(string: "\n" + tr, attributes: [
+                .font: subFont,
+                .foregroundColor: convertedSub,
+                .paragraphStyle: subPs
+            ])
+            attr.append(subAttr)
+        }
 
         let framesetter = CTFramesetterCreateWithAttributedString(attr)
         let suggested = CTFramesetterSuggestFrameSizeWithConstraints(
             framesetter,
             CFRange(location: 0, length: 0),
             nil,
-            CGSize(width: maxWidth, height: 900),
+            CGSize(width: maxWidth, height: 2400),
             nil
         )
         let w = max(1, Int(ceil(suggested.width)))
@@ -1087,11 +1321,17 @@ public final class VideoRenderer: @unchecked Sendable {
                 var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
                 let lineWidth = CTLineGetTypographicBounds(line, &ascent, &descent, &leading)
                 let lineX = origins[i].x
-                let lineY = origins[i].y - descent
-                let lineH = ascent + descent
+                let pad = 4 * scale
+                let lineY = origins[i].y - descent - pad
+                let lineH = ascent + descent + pad * 2
                 let lineRect = CGRect(x: lineX, y: lineY, width: lineWidth, height: lineH)
-                subLines.append(SubLineInfo(rect: lineRect, startChar: range.location, endChar: range.location + range.length))
-                totalChars = max(totalChars, range.location + range.length)
+
+                // 仅将主朗读英文行的字符计入卡拉OK点亮范围（译文副行保持优雅匀速光泽）
+                if range.location < primaryCharCount {
+                    let endChar = min(primaryCharCount, range.location + range.length)
+                    subLines.append(SubLineInfo(rect: lineRect, startChar: range.location, endChar: endChar))
+                    totalChars = max(totalChars, endChar)
+                }
             }
 
             if let img = ctx.makeImage() {
@@ -1099,7 +1339,7 @@ public final class VideoRenderer: @unchecked Sendable {
                     image: img,
                     size: CGSize(width: CGFloat(w), height: CGFloat(h)),
                     lines: subLines,
-                    totalChars: max(1, totalChars)
+                    totalChars: max(1, totalChars > 0 ? totalChars : primaryCharCount)
                 )
             }
         }
@@ -1469,11 +1709,10 @@ public final class VideoRenderer: @unchecked Sendable {
 
         case .waveRibbon:
             // Siri 极光流光多层光带（4 层流光谐波 + 极光色彩渐变 + 三次样条平滑曲线 + 峰值微光星尘）
-            // 贴近底边（28px），振幅上限 18px，紧密贴合而不出底界
-            let baseY: CGFloat = 28 * scale
-            let ribbonWidth: CGFloat = min(canvas.width - 40, 260 * scale)
+            let baseY: CGFloat = max(44 * scale, canvas.height * 0.046)
+            let ribbonWidth: CGFloat = min(canvas.width - 60, 440 * scale)
             let startX = (canvas.width - ribbonWidth) / 2
-            let points = 64
+            let points = 80
             let step = ribbonWidth / CGFloat(points - 1)
 
             // 提取高低频分量能量
@@ -1489,24 +1728,24 @@ public final class VideoRenderer: @unchecked Sendable {
                 trebleEnergy = CGFloat(tSum / Float(barCount - 12))
             }
 
-            // 静音时维持细腻呼吸波澜（~1.5px 优雅律动），振幅上限 18px
-            let idleBreath = CGFloat(0.35 * sin(time * 2.2))
-            let baseAmp: CGFloat = isFrameSilent ? ((1.4 + idleBreath) * scale) : min(18.0 * scale, (2.2 * scale + (bassEnergy * 11.0 + trebleEnergy * 6.5) * scale))
-            let speechAlpha: CGFloat = isFrameSilent ? 0.30 : (0.55 + avgEnergy * 0.45)
+            // 静音时维持细腻呼吸波澜（~3px 优雅律动），讲话时充沛展开（最高 46px）
+            let idleBreath = CGFloat(0.5 * sin(time * 2.2))
+            let baseAmp: CGFloat = isFrameSilent ? ((3.0 + idleBreath) * scale) : min(46.0 * scale, (5.0 * scale + (bassEnergy * 26.0 + trebleEnergy * 15.0) * scale))
+            let speechAlpha: CGFloat = isFrameSilent ? 0.40 : (0.75 + avgEnergy * 0.25)
 
             // 0. 底层柔光氛围微光（弥散光环，呼吸流动）
             if !isFrameSilent && avgEnergy > 0.02 {
-                let auraW = ribbonWidth * 0.80
-                let auraH = min(baseY * 1.4, max(12 * scale, baseAmp * 1.8))
+                let auraW = ribbonWidth * 0.85
+                let auraH = min(baseY * 1.5, max(16 * scale, baseAmp * 2.0))
                 let auraRect = CGRect(x: (canvas.width - auraW) / 2, y: baseY - auraH / 2, width: auraW, height: auraH)
                 ctx.saveGState()
-                ctx.setFillColor(highlightColor.withAlphaComponent(0.14 * avgEnergy).cgColor)
+                ctx.setFillColor(highlightColor.withAlphaComponent(0.22 * avgEnergy).cgColor)
                 ctx.fillEllipse(in: auraRect)
                 ctx.restoreGState()
             }
 
-            // 辅助：生成单条多项式缓动正弦波点集（底边保留 2.5px 紧密防穿透安全余量）
-            let maxDownwardExcursion = baseY - 2.5 * scale
+            // 辅助：生成单条多项式缓动正弦波点集
+            let maxDownwardExcursion = baseY - 4.0 * scale
             func computeWavePoints(freq1: Double, freq2: Double, freq3: Double, speed: Double, phaseOffset: Double, ampFactor: CGFloat) -> [CGPoint] {
                 var pts: [CGPoint] = []
                 pts.reserveCapacity(points)
@@ -1514,7 +1753,7 @@ public final class VideoRenderer: @unchecked Sendable {
                     let normX = Double(i) / Double(points - 1) // 0 to 1
                     let x = startX + CGFloat(i) * step
                     // 汉宁窗包络：两端平滑归零，中心饱满
-                    let env = pow(sin(normX * .pi), 1.35)
+                    let env = pow(sin(normX * .pi), 1.25)
 
                     let wave1 = sin(normX * .pi * freq1 + time * speed + phaseOffset)
                     let wave2 = cos(normX * .pi * freq2 - time * (speed * 0.75) + phaseOffset * 1.3) * 0.42
@@ -1549,55 +1788,55 @@ public final class VideoRenderer: @unchecked Sendable {
             ctx.setLineCap(.round)
             ctx.setLineJoin(.round)
 
-            // 计算极光副色（在主题色基础上产生和谐流光辉映）
+            // 计算高饱和度、清澈透明的极光副色
             let baseRGB = highlightColor
-            let auxColor1 = NSColor(calibratedRed: min(1.0, baseRGB.redComponent * 0.6 + 0.35),
-                                    green: min(1.0, baseRGB.greenComponent * 0.8 + 0.20),
-                                    blue: min(1.0, baseRGB.blueComponent * 0.4 + 0.60),
-                                    alpha: speechAlpha * 0.38)
-            let auxColor2 = NSColor(calibratedRed: min(1.0, baseRGB.redComponent * 0.9 + 0.10),
+            let auxColor1 = NSColor(calibratedRed: min(1.0, baseRGB.redComponent * 0.4 + 0.30),
                                     green: min(1.0, baseRGB.greenComponent * 0.6 + 0.35),
-                                    blue: min(1.0, baseRGB.blueComponent * 0.9 + 0.10),
-                                    alpha: speechAlpha * 0.55)
+                                    blue: min(1.0, baseRGB.blueComponent * 0.3 + 0.95),
+                                    alpha: speechAlpha * 0.65)
+            let auxColor2 = NSColor(calibratedRed: min(1.0, baseRGB.redComponent * 0.9 + 0.10),
+                                    green: min(1.0, baseRGB.greenComponent * 0.4 + 0.40),
+                                    blue: min(1.0, baseRGB.blueComponent * 0.8 + 0.20),
+                                    alpha: speechAlpha * 0.78)
 
             // 层 1：外围深邃极光反相光带（宽幅柔和）
-            let pts1 = computeWavePoints(freq1: 2.6, freq2: 4.0, freq3: 5.8, speed: 2.2, phaseOffset: .pi * 0.6, ampFactor: 0.68)
+            let pts1 = computeWavePoints(freq1: 2.4, freq2: 3.8, freq3: 5.4, speed: 2.2, phaseOffset: .pi * 0.6, ampFactor: 0.70)
             let path1 = makeSmoothPath(from: pts1)
-            ctx.setLineWidth(max(1.2, 1.8 * scale))
+            ctx.setLineWidth(max(2.2, 3.4 * scale))
             ctx.setStrokeColor(auxColor1.cgColor)
             ctx.addPath(path1)
             ctx.strokePath()
 
             // 层 2：次级高频谐波光带（灵动交错）
-            let pts2 = computeWavePoints(freq1: 3.4, freq2: 2.2, freq3: 6.2, speed: -2.8, phaseOffset: .pi * 1.25, ampFactor: 0.86)
+            let pts2 = computeWavePoints(freq1: 3.2, freq2: 2.2, freq3: 5.8, speed: -2.6, phaseOffset: .pi * 1.25, ampFactor: 0.85)
             let path2 = makeSmoothPath(from: pts2)
-            ctx.setLineWidth(max(1.4, 2.2 * scale))
+            ctx.setLineWidth(max(2.6, 4.0 * scale))
             ctx.setStrokeColor(auxColor2.cgColor)
             ctx.addPath(path2)
             ctx.strokePath()
 
             // 层 3：主光波霓虹外发光（Glow Core）
-            let ptsMain = computeWavePoints(freq1: 2.0, freq2: 3.1, freq3: 4.8, speed: 3.4, phaseOffset: 0.0, ampFactor: 1.0)
+            let ptsMain = computeWavePoints(freq1: 2.0, freq2: 3.0, freq3: 4.5, speed: 3.2, phaseOffset: 0.0, ampFactor: 1.0)
             let pathMain = makeSmoothPath(from: ptsMain)
-            ctx.setLineWidth(max(2.4, 3.8 * scale))
-            ctx.setStrokeColor(highlightColor.withAlphaComponent(speechAlpha * 0.50).cgColor)
+            ctx.setLineWidth(max(4.0, 6.2 * scale))
+            ctx.setStrokeColor(highlightColor.withAlphaComponent(speechAlpha * 0.85).cgColor)
             ctx.addPath(pathMain)
             ctx.strokePath()
 
-            // 层 4：主光波璀璨晶亮核心束（高亮白透发光核）
-            ctx.setLineWidth(max(1.2, 1.8 * scale))
-            let coreColor = NSColor.white.withAlphaComponent(isFrameSilent ? 0.35 : 0.90)
+            // 层 4：主光波璀璨晶亮核心束（高透亮白激光核，确保极度清晰锐利）
+            ctx.setLineWidth(max(1.8, 2.8 * scale))
+            let coreColor = NSColor.white.withAlphaComponent(isFrameSilent ? 0.45 : 0.98)
             ctx.setStrokeColor(coreColor.cgColor)
             ctx.addPath(pathMain)
             ctx.strokePath()
 
             // 层 5：峰值微光星尘（讲话能量高时在波峰处点缀 3 颗细微流光粒子）
-            if !isFrameSilent && avgEnergy > 0.06 {
+            if !isFrameSilent && avgEnergy > 0.05 {
                 let sparkIndices = [points / 4, points / 2, points * 3 / 4]
                 for (idx, pIdx) in sparkIndices.enumerated() {
                     let pt = ptsMain[pIdx]
-                    let sparkSize = CGFloat(2.0 + Double(idx) * 0.6) * scale
-                    let sparkAlpha = CGFloat(min(1.0, 0.4 + avgEnergy * 1.5))
+                    let sparkSize = CGFloat(2.8 + Double(idx) * 0.8) * scale
+                    let sparkAlpha = CGFloat(min(1.0, 0.5 + avgEnergy * 1.5))
                     let sparkRect = CGRect(x: pt.x - sparkSize / 2, y: pt.y - sparkSize / 2, width: sparkSize, height: sparkSize)
                     ctx.setFillColor(NSColor.white.withAlphaComponent(sparkAlpha).cgColor)
                     ctx.fillEllipse(in: sparkRect)

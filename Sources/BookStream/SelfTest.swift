@@ -602,6 +602,37 @@ enum SelfTest {
             guard coverSize > 20_000 else { throw BookStreamError.videoRenderFailed("封面图过小: \(coverSize)") }
             print("COVER GENERATION OK: \(coverURL.lastPathComponent), \(coverSize) 字节（1080x1920 高清封面图）")
 
+            // 13) 中英双语字幕（声音英文·中英双语显示）全流程自检验证
+            let bilingualSegments = [
+                TimedSegment(id: 0, text: "Tell me, O muse, of that ingenious hero.", translation: "缪斯啊，请为我歌唱那位足智多谋的英雄。", startFrame: 0, endFrame: 88200),
+                TimedSegment(id: 1, text: "Many cities did he visit and many customs did he know.", translation: "他游历了许多城市，领略了诸多邦国的风土人情。", startFrame: 88200, endFrame: 176400)
+            ]
+            let bilingualSrtURL = dir.appendingPathComponent("bilingual.srt")
+            let bilingualAssURL = dir.appendingPathComponent("bilingual.ass")
+            let bilingualMp4URL = dir.appendingPathComponent("bilingual.mp4")
+            try SrtWriter.write(segments: bilingualSegments, to: bilingualSrtURL)
+            try AssWriter.write(segments: bilingualSegments, highlight: .gold, to: bilingualAssURL)
+
+            let parsedBilingualEntries = try SrtParser.parse(url: bilingualSrtURL)
+            guard parsedBilingualEntries.count == 2,
+                  parsedBilingualEntries[0].translation == "缪斯啊，请为我歌唱那位足智多谋的英雄。" else {
+                throw BookStreamError.unsupportedFile("双语 SRT 解析往返失败")
+            }
+
+            try await renderer.render(
+                audioURL: wavURL,
+                segments: bilingualSegments,
+                outputURL: bilingualMp4URL,
+                style: CaptionStyle(highlight: .gold, theme: .darkGradient, enableKaraoke: true, enableParticles: true),
+                resolution: .p480,
+                codec: .h264,
+                progress: videoProgress,
+                cancellation: cancelled
+            )
+            let bilingualSize = (try? fm.attributesOfItem(atPath: bilingualMp4URL.path)[.size]) as? Int ?? 0
+            guard bilingualSize > 50_000 else { throw BookStreamError.videoRenderFailed("双语视频过小: \(bilingualSize)") }
+            print("BILINGUAL SUBTITLES OK: \(bilingualMp4URL.lastPathComponent), \(bilingualSize) 字节（中英双语·主英文卡拉OK·副中文典雅对齐）")
+
             print("SELFTEST PASSED")
         } catch {
             print("SELFTEST FAILED: \(error)")

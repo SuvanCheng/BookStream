@@ -22,12 +22,15 @@ public enum TTSEngineType: String, CaseIterable, Codable, Identifiable, Sendable
 public struct Sentence: Identifiable, Sendable, Equatable {
     public let id: Int
     public let text: String
+    /// 中文译文（用于双语字幕展示，可选）。
+    public var translation: String?
     /// 本句之后的停顿（秒）：段落末尾（空行）更长，句末为短停顿，营造真人朗读节奏。
-    public let pauseAfter: Double
+    public var pauseAfter: Double
 
-    public init(id: Int, text: String, pauseAfter: Double = 0) {
+    public init(id: Int, text: String, translation: String? = nil, pauseAfter: Double = 0) {
         self.id = id
         self.text = text
+        self.translation = translation
         self.pauseAfter = pauseAfter
     }
 }
@@ -38,12 +41,15 @@ public struct SubtitleEntry: Identifiable, Sendable, Equatable {
     public let start: Double
     public let end: Double
     public let text: String
+    /// 中文译文（用于双语字幕展示，可选）。
+    public var translation: String?
 
-    public init(id: Int, start: Double, end: Double, text: String) {
+    public init(id: Int, start: Double, end: Double, text: String, translation: String? = nil) {
         self.id = id
         self.start = start
         self.end = end
         self.text = text
+        self.translation = translation
     }
 }
 
@@ -57,6 +63,8 @@ public enum AudioFormat {
 public struct TimedSegment: Identifiable, Sendable, Equatable {
     public let id: Int
     public let text: String
+    /// 中文译文（用于双语字幕展示，可选）。
+    public let translation: String?
     public let startFrame: Int64
     public let endFrame: Int64
     /// 语音实际发音结束的帧位置（不包含句尾追加的静音停顿）。若未显式指定，自动按真实比例推导。
@@ -74,9 +82,10 @@ public struct TimedSegment: Identifiable, Sendable, Equatable {
         return max(0.05, duration * 0.84)
     }
 
-    public init(id: Int, text: String, startFrame: Int64, endFrame: Int64, speechEndFrame: Int64? = nil) {
+    public init(id: Int, text: String, translation: String? = nil, startFrame: Int64, endFrame: Int64, speechEndFrame: Int64? = nil) {
         self.id = id
         self.text = text
+        self.translation = translation
         self.startFrame = startFrame
         self.endFrame = endFrame
         self.speechEndFrame = speechEndFrame
@@ -160,6 +169,23 @@ public struct TextFix: Sendable, Equatable {
 }
 
 public enum TextProcessor {
+
+    /// 计算文本中汉字比例（0.0 ~ 1.0）
+    public static func hanRatio(of text: String) -> Double {
+        let hanChars = text.unicodeScalars.filter {
+            (0x4E00...0x9FFF).contains($0.value) || (0x3400...0x4DBF).contains($0.value)
+        }.count
+        let totalLetters = text.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
+        guard totalLetters > 0 else { return 0 }
+        return Double(hanChars) / Double(totalLetters)
+    }
+
+    /// 判断文本是否主要为英文
+    public static func isPrimarilyEnglish(_ text: String) -> Bool {
+        let latinCount = text.unicodeScalars.filter { ($0.value >= 0x0041 && $0.value <= 0x005A) || ($0.value >= 0x0061 && $0.value <= 0x007A) }.count
+        let hanCount = text.unicodeScalars.filter { (0x4E00...0x9FFF).contains($0.value) || (0x3400...0x4DBF).contains($0.value) }.count
+        return latinCount > 0 && latinCount >= hanCount * 2
+    }
 
     /// 标点分句：以句号/问号/感叹号为边界；逗号、分号仅作句中停顿。
     /// 合并过短碎片（< 2 字符）至上一句，保证语流连贯。
@@ -863,11 +889,38 @@ public enum SrtParser {
                         textLines.append(tl)
                         j += 1
                     }
+
+                    // 智能双语字幕识别：区分主要英文行与中文译文行
+                    let entryText: String
+                    let entryTranslation: String?
+                    if textLines.count >= 2 {
+                        var enParts: [String] = []
+                        var zhParts: [String] = []
+                        for tl in textLines {
+                            if TextProcessor.hanRatio(of: tl) >= 0.20 {
+                                zhParts.append(tl)
+                            } else {
+                                enParts.append(tl)
+                            }
+                        }
+                        if !enParts.isEmpty && !zhParts.isEmpty {
+                            entryText = enParts.joined(separator: " ")
+                            entryTranslation = zhParts.joined(separator: " ")
+                        } else {
+                            entryText = textLines.joined(separator: " ")
+                            entryTranslation = nil
+                        }
+                    } else {
+                        entryText = textLines.joined(separator: " ")
+                        entryTranslation = nil
+                    }
+
                     entries.append(SubtitleEntry(
                         id: index,
                         start: start,
                         end: end,
-                        text: textLines.joined(separator: " ")
+                        text: entryText,
+                        translation: entryTranslation
                     ))
                     index += 1
                     i = j
@@ -932,10 +985,19 @@ public enum AssParser {
             guard fields.count >= 10 else { continue }
             guard let start = parseTime(fields[1]), let end = parseTime(fields[2]) else { continue }
 
-            let text = stripTags(fields[9])
+            let rawText = fields[9]
+            // 支持 ASS 内嵌 \N 换行双语拆分
+            let parts = rawText.components(separatedBy: "\\N")
+            let text = stripTags(parts[0])
+            let translation = parts.count > 1 ? stripTags(parts[1]) : nil
+
             if !text.isEmpty {
                 entries.append(SubtitleEntry(
-                    id: entries.count, start: start, end: end, text: text
+                    id: entries.count,
+                    start: start,
+                    end: end,
+                    text: text,
+                    translation: (translation?.isEmpty == false) ? translation : nil
                 ))
             }
         }
@@ -978,7 +1040,11 @@ public enum SrtWriter {
         for (i, seg) in segments.enumerated() {
             out += "\(i + 1)\n"
             out += "\(formatTime(seg.start)) --> \(formatTime(seg.end))\n"
-            out += seg.text + "\n\n"
+            if let tr = seg.translation, !tr.isEmpty {
+                out += seg.text + "\n" + tr + "\n\n"
+            } else {
+                out += seg.text + "\n\n"
+            }
         }
         try out.write(to: url, atomically: true, encoding: .utf8)
     }
@@ -1014,7 +1080,13 @@ public enum AssWriter {
         Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         """
         for seg in segments {
-            out += "\nDialogue: 0,\(assTime(seg.start)),\(assTime(seg.end)),Default,,0,0,0,,\(escape(seg.text))"
+            if let tr = seg.translation, !tr.isEmpty {
+                let escapedText = escape(seg.text)
+                let escapedTr = escape(tr)
+                out += "\nDialogue: 0,\(assTime(seg.start)),\(assTime(seg.end)),Default,,0,0,0,,\(escapedText)\\N{\\fs46\\c&HE0E0E0&}\(escapedTr)"
+            } else {
+                out += "\nDialogue: 0,\(assTime(seg.start)),\(assTime(seg.end)),Default,,0,0,0,,\(escape(seg.text))"
+            }
         }
         try out.write(to: url, atomically: true, encoding: .utf8)
     }

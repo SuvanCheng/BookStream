@@ -274,6 +274,7 @@ public final class AudioEngine: @unchecked Sendable {
                 segments.append(TimedSegment(
                     id: i,
                     text: sentence.text,
+                    translation: sentence.translation,
                     startFrame: frameCursor,
                     endFrame: frameCursor + voiceFrames + pauseFrames,
                     speechEndFrame: frameCursor + voiceFrames
@@ -380,6 +381,7 @@ public final class AudioEngine: @unchecked Sendable {
                 segments.append(TimedSegment(
                     id: i,
                     text: entry.text,
+                    translation: entry.translation,
                     startFrame: startFrame,
                     endFrame: captionEnd,
                     speechEndFrame: startFrame + voiceFrames
@@ -426,6 +428,7 @@ public final class AudioEngine: @unchecked Sendable {
                 segments.append(TimedSegment(
                     id: i,
                     text: entry.text,
+                    translation: entry.translation,
                     startFrame: startFrame,
                     endFrame: captionEnd,
                     speechEndFrame: startFrame + min(voiceFrames, captionEnd - startFrame)
