@@ -55,6 +55,32 @@ public final class EdgeTTS: @unchecked Sendable {
         EdgeVoice(id: "es-ES-AlvaroNeural", displayName: "Alvaro (西语·醇厚男声)", language: "es-ES", gender: "男声", tag: "西语精选")
     ]
 
+    private static let processLock = NSLock()
+    nonisolated(unsafe) private static var activeProcesses = Set<Process>()
+
+    public static func registerActiveProcess(_ process: Process) {
+        processLock.lock()
+        defer { processLock.unlock() }
+        activeProcesses.insert(process)
+    }
+
+    public static func unregisterActiveProcess(_ process: Process) {
+        processLock.lock()
+        defer { processLock.unlock() }
+        activeProcesses.remove(process)
+    }
+
+    /// 强制清理所有活动子进程（App 退出或 Cmd+Q 时调用）
+    public static func terminateAllActiveSubprocesses() {
+        processLock.lock()
+        defer { processLock.unlock() }
+        for proc in activeProcesses {
+            proc.terminate()
+            kill(proc.processIdentifier, SIGKILL)
+        }
+        activeProcesses.removeAll()
+    }
+
     public init() {}
 
     private static func findPythonURL() -> URL {
@@ -86,9 +112,15 @@ public final class EdgeTTS: @unchecked Sendable {
     }
 
     /// 单句高保真抓轨合成
-    public func render(text: String, voiceId: String, rate: Float) throws -> [AVAudioPCMBuffer] {
+    public func render(
+        text: String,
+        voiceId: String,
+        rate: Float,
+        cancellation: (@Sendable () -> Bool)? = nil
+    ) throws -> [AVAudioPCMBuffer] {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.contains(where: { $0.isLetter || $0.isNumber }) else { return [] }
+        if cancellation?() == true { throw BookStreamError.cancelled }
 
         let fm = FileManager.default
         let tmpDir = fm.temporaryDirectory
@@ -111,7 +143,20 @@ public final class EdgeTTS: @unchecked Sendable {
         let errPipe = Pipe()
         proc.standardError = errPipe
         try proc.run()
-        proc.waitUntilExit()
+        Self.registerActiveProcess(proc)
+        defer { Self.unregisterActiveProcess(proc) }
+
+        // 毫秒级非阻塞轮询
+        while proc.isRunning {
+            if cancellation?() == true {
+                proc.terminate()
+                kill(proc.processIdentifier, SIGKILL)
+                throw BookStreamError.cancelled
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
+        if cancellation?() == true { throw BookStreamError.cancelled }
 
         guard proc.terminationStatus == 0, fm.fileExists(atPath: outMP3.path) else {
             let errData = errPipe.fileHandleForReading.readDataToEndOfFile()

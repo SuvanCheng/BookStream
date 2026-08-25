@@ -13,6 +13,16 @@ struct BookStreamApp: App {
     @StateObject private var model = AppModel()
 
     init() {
+        // 监听应用退出通知（Cmd+Q、Dock 退出、系统关机等），确保所有后台子进程被即时全部终止，不残留孤儿进程
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: nil
+        ) { _ in
+            KokoroTTS.terminateAllActiveSubprocesses()
+            EdgeTTS.terminateAllActiveSubprocesses()
+        }
+
         // 无头模式：swift run BookStream --selftest | --parse <file> | --readframe <mp4>
         if CommandLine.arguments.contains("--selftest")
             || CommandLine.arguments.contains("--parse")

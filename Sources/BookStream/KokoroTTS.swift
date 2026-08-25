@@ -60,6 +60,32 @@ public final class KokoroTTS: @unchecked Sendable {
     private let workerURL: URL
     private let modelURL: URL
 
+    private static let processLock = NSLock()
+    nonisolated(unsafe) private static var activeProcesses = Set<Process>()
+
+    public static func registerActiveProcess(_ process: Process) {
+        processLock.lock()
+        defer { processLock.unlock() }
+        activeProcesses.insert(process)
+    }
+
+    public static func unregisterActiveProcess(_ process: Process) {
+        processLock.lock()
+        defer { processLock.unlock() }
+        activeProcesses.remove(process)
+    }
+
+    /// 强制清理所有活动子进程（App 退出或 Cmd+Q 时调用）
+    public static func terminateAllActiveSubprocesses() {
+        processLock.lock()
+        defer { processLock.unlock() }
+        for proc in activeProcesses {
+            proc.terminate()
+            kill(proc.processIdentifier, SIGKILL)
+        }
+        activeProcesses.removeAll()
+    }
+
     public init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let envPython = home.appendingPathComponent(".bookstream/kokoro-env/bin/python3")
@@ -80,9 +106,15 @@ public final class KokoroTTS: @unchecked Sendable {
     }
 
     /// 单句同步合成（调用本地 Python ONNX 管道）
-    public func render(text: String, voice: String, rate: Float) throws -> [AVAudioPCMBuffer] {
+    public func render(
+        text: String,
+        voice: String,
+        rate: Float,
+        cancellation: (@Sendable () -> Bool)? = nil
+    ) throws -> [AVAudioPCMBuffer] {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.contains(where: { $0.isLetter || $0.isNumber }) else { return [] }
+        if cancellation?() == true { throw BookStreamError.cancelled }
 
         guard Self.isAvailable() else {
             throw BookStreamError.audioRenderFailed("Kokoro 本地模型未就绪（~/.bookstream/kokoro/kokoro-v1.0.onnx）")
@@ -117,7 +149,20 @@ public final class KokoroTTS: @unchecked Sendable {
         let pipe = Pipe()
         process.standardError = pipe
         try process.run()
-        process.waitUntilExit()
+        Self.registerActiveProcess(process)
+        defer { Self.unregisterActiveProcess(process) }
+
+        // 毫秒级非阻塞轮询：一旦用户点击取消，立即杀掉 Python 子进程并退出
+        while process.isRunning {
+            if cancellation?() == true {
+                process.terminate()
+                kill(process.processIdentifier, SIGKILL)
+                throw BookStreamError.cancelled
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
+        if cancellation?() == true { throw BookStreamError.cancelled }
 
         guard process.terminationStatus == 0 && fm.fileExists(atPath: wavPath.path) else {
             let errData = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -145,9 +190,12 @@ public final class KokoroTTS: @unchecked Sendable {
         texts: [String],
         voice: String,
         rate: Float,
-        onProgress: (@Sendable (Int, Int) -> Void)? = nil
+        onProgress: (@Sendable (Int, Int) -> Void)? = nil,
+        cancellation: (@Sendable () -> Bool)? = nil
     ) throws -> [[AVAudioPCMBuffer]] {
         guard !texts.isEmpty else { return [] }
+        if cancellation?() == true { throw BookStreamError.cancelled }
+
         guard Self.isAvailable() else {
             throw BookStreamError.audioRenderFailed("Kokoro 本地模型未就绪（~/.bookstream/kokoro/kokoro-v1.0.onnx）")
         }
@@ -203,8 +251,22 @@ public final class KokoroTTS: @unchecked Sendable {
         }
 
         try process.run()
-        process.waitUntilExit()
+        Self.registerActiveProcess(process)
+        defer { Self.unregisterActiveProcess(process) }
+
+        // 毫秒级非阻塞轮询：一旦用户点击取消，立即杀掉 Python 子进程并退出
+        while process.isRunning {
+            if cancellation?() == true {
+                outHandle.readabilityHandler = nil
+                process.terminate()
+                kill(process.processIdentifier, SIGKILL)
+                throw BookStreamError.cancelled
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
         outHandle.readabilityHandler = nil
+
+        if cancellation?() == true { throw BookStreamError.cancelled }
 
         guard process.terminationStatus == 0 && fm.fileExists(atPath: outJson.path) else {
             let errData = errPipe.fileHandleForReading.readDataToEndOfFile()

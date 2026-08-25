@@ -219,7 +219,7 @@ public final class AudioEngine: @unchecked Sendable {
 
         let allTexts = sentences.map(\.text)
         var s = 0
-        let batchSize = (engine == .kokoro) ? 512 : 16
+        let batchSize = (engine == .kokoro) ? 64 : 16
         while s < sentences.count {
             if cancellation() { throw BookStreamError.cancelled }
             let end = min(s + batchSize, sentences.count)
@@ -234,17 +234,20 @@ public final class AudioEngine: @unchecked Sendable {
                     rate: rate,
                     onProgress: { [self] cur, _ in
                         self.reportProgress(progress, done: baseIndex + cur, total: sentences.count)
-                    }
+                    },
+                    cancellation: cancellation
                 )
             } else {
                 perSentence = try windowTexts.map { t in
-                    try renderOne(
+                    if cancellation() { throw BookStreamError.cancelled }
+                    return try renderOne(
                         sentence: t,
                         engine: engine,
                         kokoroVoice: kokoroVoice,
                         edgeVoice: edgeVoice,
                         customAPISettings: customAPISettings,
-                        rate: rate
+                        rate: rate,
+                        cancellation: cancellation
                     )
                 }
             }
@@ -317,7 +320,8 @@ public final class AudioEngine: @unchecked Sendable {
                 rate: rate,
                 onProgress: { [self] cur, tot in
                     self.reportProgress(progress, done: cur, total: tot)
-                }
+                },
+                cancellation: cancellation
             )
         } else {
             allPrecomputed = []
@@ -346,7 +350,8 @@ public final class AudioEngine: @unchecked Sendable {
                     kokoroVoice: kokoroVoice,
                     edgeVoice: edgeVoice,
                     customAPISettings: customAPISettings,
-                    rate: rate
+                    rate: rate,
+                    cancellation: cancellation
                 )
             }
             let converted = try convertAll(rawBuffers, to: pcmMono44k)
@@ -444,25 +449,27 @@ public final class AudioEngine: @unchecked Sendable {
         kokoroVoice: String? = nil,
         edgeVoice: String? = nil,
         customAPISettings: CustomAPISettings? = nil,
-        rate: Float
+        rate: Float,
+        cancellation: (@Sendable () -> Bool)? = nil
     ) throws -> [AVAudioPCMBuffer] {
         let trimmed = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.contains(where: { $0.isLetter || $0.isNumber }) {
             return []
         }
+        if cancellation?() == true { throw BookStreamError.cancelled }
 
         switch engine {
         case .kokoro:
             let vid = kokoroVoice ?? "af_heart"
-            return try KokoroTTS.shared.render(text: sentence, voice: vid, rate: rate)
+            return try KokoroTTS.shared.render(text: sentence, voice: vid, rate: rate, cancellation: cancellation)
 
         case .edgeTTS:
             let vid = edgeVoice ?? "en-US-ChristopherNeural"
-            return try EdgeTTS.shared.render(text: sentence, voiceId: vid, rate: rate)
+            return try EdgeTTS.shared.render(text: sentence, voiceId: vid, rate: rate, cancellation: cancellation)
 
         case .customAPI:
             let settings = customAPISettings ?? .default
-            return try CustomAPITTS.shared.render(text: sentence, settings: settings, rate: rate)
+            return try CustomAPITTS.shared.render(text: sentence, settings: settings, rate: rate, cancellation: cancellation)
         }
     }
 

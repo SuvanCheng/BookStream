@@ -81,10 +81,16 @@ public final class CustomAPITTS: @unchecked Sendable {
 
     public init() {}
 
-    /// 同步渲染单句音频（通过 URLSession 阻塞等待并转换格式）
-    public func render(text: String, settings: CustomAPISettings, rate: Float) throws -> [AVAudioPCMBuffer] {
+    /// 同步渲染单句音频（通过 URLSession 请求并转换格式）
+    public func render(
+        text: String,
+        settings: CustomAPISettings,
+        rate: Float,
+        cancellation: (@Sendable () -> Bool)? = nil
+    ) throws -> [AVAudioPCMBuffer] {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.contains(where: { $0.isLetter || $0.isNumber }) else { return [] }
+        if cancellation?() == true { throw BookStreamError.cancelled }
 
         guard let url = URL(string: settings.endpointURL.isEmpty ? "https://api.openai.com/v1/audio/speech" : settings.endpointURL) else {
             throw BookStreamError.audioRenderFailed("无效的 API Endpoint URL")
@@ -129,20 +135,34 @@ public final class CustomAPITTS: @unchecked Sendable {
         final class ResponseBox: @unchecked Sendable {
             var data: Data?
             var error: Error?
+            var completed = false
         }
         let box = ResponseBox()
 
-        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+        var dataTask: URLSessionDataTask?
+        dataTask = URLSession.shared.dataTask(with: request) { data, response, error in
             box.data = data
             box.error = error
+            box.completed = true
             if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
                 let errStr = data.flatMap { String(data: $0, encoding: .utf8) } ?? "HTTP \(http.statusCode)"
                 box.error = BookStreamError.audioRenderFailed("API 请求失败 (\(http.statusCode)): \(errStr.prefix(120))")
             }
             sema.signal()
         }
-        task.resume()
-        _ = sema.wait(timeout: .now() + 35)
+        dataTask?.resume()
+
+        while !box.completed {
+            if cancellation?() == true {
+                dataTask?.cancel()
+                throw BookStreamError.cancelled
+            }
+            if sema.wait(timeout: .now() + 0.05) == .success {
+                break
+            }
+        }
+
+        if cancellation?() == true { throw BookStreamError.cancelled }
 
         if let fetchError = box.error { throw fetchError }
         guard let data = box.data, !data.isEmpty else {
