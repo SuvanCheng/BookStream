@@ -11,8 +11,10 @@ import os
 final class AppModel: ObservableObject {
 
     enum ExportMode: String, CaseIterable, Identifiable {
-        case audioSRT = "离线音频 + SRT"
-        case video = "动态字幕视频"
+        case srt   = "SRT 字幕"
+        case audio = "WAV 无损"
+        case m4b   = "M4B 有声书"
+        case video = "字幕视频"
         var id: String { rawValue }
     }
 
@@ -65,26 +67,61 @@ final class AppModel: ObservableObject {
     // 设置
     @Published var voices: [VoiceInfo] = []
     @Published var selectedVoiceID: String?
-    @Published var speechRate: Float = 0.5
-    @Published var pauseScale: Float = 1.0   // 句间/段间停顿倍数（0=无停顿，2=两倍）
+    /// 背景音乐预设（涵盖 macOS 经典大自然白噪音与和弦轻音乐）
+    enum BGMPreset: String, CaseIterable, Identifiable {
+        case none           = "关闭"
+        case gentlePiano    = "舒缓和弦氛围乐 (内置)"
+        case oceanWaves     = "海浪波涛·潮汐声 (内置)"
+        case rainAmbience   = "沉浸雨声·雨滴白噪音 (内置)"
+        case mountainStream = "山间小溪·潺潺流水 (内置)"
+        case forestWind     = "林间微风·自然呼吸 (内置)"
+        case darkNoise      = "暗噪音·深沉静谧 (内置)"
+        case pinkNoise      = "平衡粉噪·清爽专注 (内置)"
+        case custom         = "自选音频文件..."
+        var id: String { rawValue }
+    }
+
+    @Published var speechRate: Float = 0.4
+    @Published var pauseScale: Float = 1.4   // 句间/段间停顿倍数（默认 1.4x）
     @Published var exportMode: ExportMode = .video
     @Published var highlightColor: CaptionColor = .vividOrange
-    @Published var videoResolution: VideoResolution = .p1080
+    @Published var backgroundTheme: BackgroundTheme = .pureBlack
+    @Published var showVisualizer: Bool = true
+    @Published var enableKaraoke: Bool = true
+    @Published var subtitleFont: SubtitleFont = .systemDefault
+    @Published var videoAspectRatio: VideoAspectRatio = .portrait9_16 // 默认 9:16 竖屏短视频
+    @Published var videoQuality: VideoQuality = .p480
+    @Published var videoCodec: VideoCodec = .hevc // 默认 H.265 / HEVC 硬件加速
+    @Published var exportByChapter: Bool = false
+    @Published var frameRate: Int = 24   // 视频帧率（默认 24 fps 电影感）
+
+    // 背景音乐（BGM 混音 + 智能侧链压限）
+    @Published var bgmPreset: BGMPreset = .none
+    @Published var bgmURL: URL?
+    @Published var bgmVolume: Float = 0.03 // 默认 3% 舒适微弱背景音
+    @Published var enableDucking: Bool = true
+
+    var videoResolution: VideoResolution {
+        VideoResolution.make(aspectRatio: videoAspectRatio, quality: videoQuality)
+    }
 
     // 本地 AI 音色（Piper）
     @Published var piperModels: [PiperVoice] = []
-    @Published var selectedPiperVoiceID: String?   // nil = 使用系统声音
+    @Published var selectedPiperVoiceID: String?   // 选中 AI 音色：可指向已安装模型 id，或目录条目 id（未下载，生成时自动下载）；nil = 使用系统声音
     @Published var piperEngineInstalled = false
     @Published var isPiperInstalling = false
     @Published var isModelDownloading = false
     @Published var piperQuality: PiperQuality = .medium
     @Published var piperCatalog: [PiperCatalogEntry] = []
-    @Published var selectedCatalogEntryID: String?   // 目录中想下载的模型名
     @Published var catalogLoadFailed = false
+    // 首次刷新时是否已确立 AI 音色默认（只自动选一次，不覆盖用户后续手工选择）
+    private var piperDefaultChosen = false
 
     // 已有音频复用（字幕输入 + 视频模式时，可跳过 TTS）
     @Published var useExistingAudio = false
     @Published var companionAudioURL: URL?
+    @Published var smartParse = true   // 智能解析：自动修复原文标点（补漏/改错/折叠重复），可关闭
+    @Published var splitLongSentences = true   // L3：超长句（>60 字）按软边界拆短
 
     // 字幕旁白溢出策略（语音长于字幕窗口时：顺延 / 截断）
     @Published var subtitleOverflowPolicy: SubtitleOverflowPolicy = .extend
@@ -105,6 +142,10 @@ final class AppModel: ObservableObject {
     private var hasUserPickedVoice = false
     private var previewSynthesizer: AVSpeechSynthesizer?
     private var previewAudioPlayer: AVAudioPlayer?
+    /// 导出计时与进度日志状态（每次导出开始与阶段切换时重置）。
+    private var exportStartTime = Date()
+    private var phaseStartTime = Date()
+    private var lastLoggedPercent = -1
 
     // MARK: - 派生信息
 
@@ -113,16 +154,46 @@ final class AppModel: ObservableObject {
         switch input {
         case .book(let title, let sentences):
             let chars = sentences.reduce(0) { $0 + $1.text.count }
-            let est = Double(chars) / 12.5
-            return "\(title) · \(sentences.count) 句 · \(chars) 字 · 预估 \(formatDuration(est))"
+            let hanRatio = Self.hanRatio(of: sentences.prefix(200).map(\.text).joined())
+            let audioEst = Self.estimateAudioDuration(chars: chars, hanRatio: hanRatio, rate: speechRate)
+            let genEst = Self.estimateGenerationTime(chars: chars, audioDur: audioEst, resolution: videoResolution)
+            return "\(title) · \(sentences.count) 句 · \(chars) 字 · 音频约 \(Self.formatDuration(audioEst)) · 生成约 \(Self.formatDuration(genEst))"
         case .subtitles(let title, let entries):
             let dur = entries.last.map { $0.end } ?? 0
-            return "\(title) · \(entries.count) 条 · 总时长 \(formatDuration(dur))"
+            return "\(title) · \(entries.count) 条 · 总时长 \(Self.formatDuration(dur))"
         }
     }
 
-    private func formatDuration(_ s: Double) -> String {
-        let total = Int(s)
+    /// 文本中汉字占比（预估语速用）。
+    private static func hanRatio(of text: String) -> Double {
+        let scalars = text.unicodeScalars
+        guard !scalars.isEmpty else { return 0 }
+        let han = scalars.filter { $0.properties.isIdeographic }.count
+        return Double(han) / Double(scalars.count)
+    }
+
+    /// 预估音频时长（秒）：中文约 4.8 字/秒、英文约 17 字/秒（基准 0.5 语速），
+    /// 语速缩放与 Piper 的 length-scale 一致：1 + (0.5 - rate) * 1.2。
+    private static func estimateAudioDuration(chars: Int, hanRatio: Double, rate: Float) -> Double {
+        guard chars > 0 else { return 0 }
+        let base = hanRatio > 0.2 ? 4.8 : 17.0
+        let rateScale = 1.0 + Double(0.5 - rate) * 1.2
+        return Double(chars) / base * rateScale
+    }
+
+    /// 预估生成耗时（秒）：TTS 合成 + 视频渲染。
+    /// 基准（实测校准）：Piper 本地引擎约 600 字/秒；视频渲染约 20× 实时（480p），
+    /// 随分辨率像素数反比缩放（1080p≈9×，4K≈2×）。
+    private static func estimateGenerationTime(chars: Int, audioDur: Double, resolution: VideoResolution) -> Double {
+        let tts = Double(chars) / 600.0
+        let px = Double(resolution.width * resolution.height)
+        let videoRealtime = 20.0 * (921_600.0 / max(px, 1))   // 480p 像素 = 921600
+        let video = audioDur / max(videoRealtime, 1)
+        return tts + video
+    }
+
+    private static func formatDuration(_ s: Double) -> String {
+        let total = Int(s.rounded())
         let h = total / 3600
         let m = (total % 3600) / 60
         let sec = total % 60
@@ -321,9 +392,23 @@ final class AppModel: ObservableObject {
         PiperTTS.invalidateEngineCache()   // 安装/下载后引擎探测结果可能已变
         piperEngineInstalled = PiperTTS.engineStatus() != .notInstalled
         piperModels = PiperTTS.listModels()
-        if let selected = selectedPiperVoiceID,
-           !piperModels.contains(where: { $0.id == selected }) {
-            selectedPiperVoiceID = nil
+        // 需求：默认音色 = AI 音色里可用的第一个；只有首次刷新、且用户未手工选过时才自动确立，
+        // 之后不再覆盖用户选择（选了“使用系统声音”也保留）。
+        if !piperDefaultChosen {
+            if let first = piperModels.first, selectedPiperVoiceID == nil {
+                selectedPiperVoiceID = first.id
+                log("默认使用 AI 音色: \(first.displayName) · \(first.language)")
+            }
+            piperDefaultChosen = true
+        }
+        if let selected = selectedPiperVoiceID {
+            // 仅当该 id 既不是已安装模型、也不是目录条目时，才视为失效清空；
+            // 允许“仅选中未下载目录音色”（保留，生成时自动下载）。
+            let installed = piperModels.contains { $0.id == selected }
+            let catalogOK = piperCatalog.contains { $0.id == selected }
+            if !installed && !catalogOK {
+                selectedPiperVoiceID = nil
+            }
         }
         if piperEngineInstalled {
             log("AI 引擎就绪（\(piperModels.count) 个本地音色模型）")
@@ -338,10 +423,6 @@ final class AppModel: ObservableObject {
                 await MainActor.run {
                     self.piperCatalog = catalog
                     self.catalogLoadFailed = false
-                    if let cur = self.selectedCatalogEntryID,
-                       !catalog.contains(where: { $0.id == cur }) {
-                        self.selectedCatalogEntryID = catalog.first?.id
-                    }
                 }
             } catch {
                 await MainActor.run { self.catalogLoadFailed = true }
@@ -383,48 +464,51 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 一次性下载指定音色模型（rhasspy/piper-voices；之后完全离线）。
-    func downloadPiperModel(language: String, dataset: String) {
-        guard !isModelDownloading else { return }
+    /// 下载指定目录条目（按 id），并**等待到完成/失败**后返回结果。
+    /// 返回下载后的 PiperVoice；失败时抛出。用于「选中未下载音色 → 生成前自动下载」。
+    func downloadCatalogEntryAndWait(_ id: String) async throws -> PiperVoice {
+        guard !isModelDownloading else {
+            throw BookStreamError.audioRenderFailed("已有音色在下载中，请稍后再试")
+        }
+        guard let entry = piperCatalog.first(where: { $0.id == id }) else {
+            throw BookStreamError.audioRenderFailed("该音色不在可下载目录中: \(id)")
+        }
         isModelDownloading = true
         let quality = piperQuality.rawValue
-        log("正在下载 AI 音色 \(language)-\(dataset)-\(quality)（约 20~125MB，一次性；若该档位不存在会自动回退到更低档）...")
-        // 优先用目录规范路径（含语言族前缀），目录未加载时才回退到按语言-数据集拼的旧路径。
-        let catalogEntry = piperCatalog.first { $0.id == "\(language)-\(dataset)" }
-        Task.detached(priority: .userInitiated) {
-            do {
-                let voice: PiperVoice
-                if let entry = catalogEntry {
-                    voice = try PiperTTS.downloadCanonical(catalogEntry: entry, quality: quality)
-                } else {
-                    voice = try PiperTTS.downloadModel(language: language, dataset: dataset, quality: quality)
-                }
-                DispatchQueue.main.async {
-                    MainActor.assumeIsolated {
-                        self.isModelDownloading = false
-                        self.refreshPiper()
-                        self.log("AI 音色下载完成: \(voice.displayName) · \(voice.language)（\(voice.id)）")
-                    }
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    MainActor.assumeIsolated {
-                        self.isModelDownloading = false
-                        self.log("AI 音色下载失败: \(error.localizedDescription)")
-                    }
-                }
-            }
+        log("生成前自动下载 AI 音色 \(entry.displayName)（档位 \(quality)）...")
+        do {
+            let voice = try await Task.detached(priority: .userInitiated) {
+                try PiperTTS.downloadCanonical(catalogEntry: entry, quality: quality)
+            }.value
+            self.isModelDownloading = false
+            self.refreshPiper()
+            self.log("AI 音色下载完成: \(voice.displayName) · \(voice.language)（\(voice.id)）")
+            return voice
+        } catch {
+            self.isModelDownloading = false
+            self.log("AI 音色下载失败: \(error.localizedDescription)")
+            throw error
         }
     }
 
-    /// 从目录下载当前选中的音色模型（语言-数据集 + 当前质量档，含自动回退档位）。
-    func downloadCatalogEntry() {
-        guard let id = selectedCatalogEntryID,
-              let entry = piperCatalog.first(where: { $0.id == id }) else {
-            log("请先在目录里选择一个音色模型")
+    /// 删除已下载的音色模型（.onnx/.onnx.json 一并移除），并清理选中状态。
+    func deletePiperVoice(_ voice: PiperVoice) {
+        guard piperModels.contains(where: { $0.id == voice.id }) else { return }
+        PiperTTS.deleteModel(voice)
+        if selectedPiperVoiceID == voice.id { selectedPiperVoiceID = nil }
+        refreshPiper()
+        log("已删除 AI 音色: \(voice.displayName) · \(voice.language)")
+    }
+
+    /// 手动下载「选中的未下载目录音色」（不阻塞，后台跑完回调刷新列表）。
+    func startSelectedVoiceDownload() {
+        guard let id = selectedPiperVoiceID,
+              let entry = piperCatalog.first(where: { $0.id == id }),
+              selectedPiperVoice == nil else { return }
+        guard !isModelDownloading else {
+            log("已有音色在下载中，请稍后再试")
             return
         }
-        guard !isModelDownloading else { return }
         isModelDownloading = true
         let quality = piperQuality.rawValue
         log("正在下载 AI 音色 \(entry.displayName)（档位 \(quality)，约 20~60MB）...")
@@ -449,15 +533,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 目录选中项的描述：显示该音色实际可用的质量档位。
-    var catalogSelectionDescription: String {
-        guard let id = selectedCatalogEntryID,
-              let entry = piperCatalog.first(where: { $0.id == id }) else { return "未选择" }
-        let qs = entry.availableQualities.isEmpty ? "档位未知" : entry.availableQualities.joined(separator: "/")
-        let already = piperModels.contains { $0.id.hasPrefix("\(entry.language)-\(entry.dataset)-") }
-        return "\(entry.displayName) · 档位 \(qs)\(already ? " · ✓已下载" : "")"
-    }
-
     func loadInput(url: URL) async {
         let t0 = Date()
         log("解析输入: \(url.lastPathComponent)（\(url.path)）")
@@ -466,8 +541,10 @@ final class AppModel: ObservableObject {
             let ext = url.pathExtension.lowercased()
             switch ext {
             case "txt", "epub":
-                let sentences = try await Task.detached(priority: .userInitiated) {
-                    try TextProcessor.parseBookFile(url: url)
+                let repair = smartParse
+                let splitLong = splitLongSentences
+                let (sentences, fixes) = try await Task.detached(priority: .userInitiated) {
+                    try TextProcessor.parseBookFile(url: url, repair: repair, splitLong: splitLong)
                 }.value
                 inputKind = .book(
                     title: url.deletingPathExtension().lastPathComponent,
@@ -475,6 +552,11 @@ final class AppModel: ObservableObject {
                 )
                 let chars = sentences.reduce(0) { $0 + $1.text.count }
                 log("书籍解析完成: \(sentences.count) 句 / \(chars) 字（\(String(format: "%.2f", Date().timeIntervalSince(t0)))s）")
+                let han = Self.hanRatio(of: sentences.prefix(200).map(\.text).joined())
+                let audioEst = Self.estimateAudioDuration(chars: chars, hanRatio: han, rate: speechRate)
+                let genEst = Self.estimateGenerationTime(chars: chars, audioDur: audioEst, resolution: videoResolution)
+                log("预估: 音频时长约 \(Self.formatDuration(audioEst)) · 生成耗时约 \(Self.formatDuration(genEst))（TTS 约 \(Self.formatDuration(Double(chars) / 500.0)) + 视频渲染约 \(Self.formatDuration(audioEst / max(20.0 * (921_600.0 / Double(videoResolution.width * videoResolution.height)), 1)))）")
+                logTextFixes(fixes)
             case "srt":
                 let entries = try await Task.detached(priority: .userInitiated) {
                     try SrtParser.parse(url: url)
@@ -528,14 +610,96 @@ final class AppModel: ObservableObject {
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
         let stamp = Int(Date().timeIntervalSince1970)
+        // 文件名格式：书名-音色名-[AI|sys]-语速-停顿x-分辨率-mark|nomark-时间戳.mp4
+        // 例：1-danny-[AI]-0.5-1.0x-480p-mark-1787312689.mp4
+        let title = {
+            switch input {
+            case .book(let t, _): return t
+            case .subtitles(let t, _): return t
+            }
+        }()
+        let voiceCore: String
+        let voiceTag: String
+        if let aiName = selectedVoiceDisplayName {
+            voiceCore = aiName
+            voiceTag = "[AI]"
+        } else {
+            voiceCore = voices.first { $0.id == selectedVoiceID }?.name ?? "系统默认"
+            voiceTag = "[sys]"
+        }
+        let rateStr = String(format: "%.1f", speechRate)
+        let pauseStr = String(format: "%.1fx", pauseScale)
+
+        let bgmTag: String = {
+            switch bgmPreset {
+            case .none:
+                return "nobgm"
+            case .gentlePiano:
+                return "bgm-piano-\(Int(bgmVolume * 100))"
+            case .oceanWaves:
+                return "bgm-ocean-\(Int(bgmVolume * 100))"
+            case .rainAmbience:
+                return "bgm-rain-\(Int(bgmVolume * 100))"
+            case .mountainStream:
+                return "bgm-stream-\(Int(bgmVolume * 100))"
+            case .forestWind:
+                return "bgm-forest-\(Int(bgmVolume * 100))"
+            case .darkNoise:
+                return "bgm-darknoise-\(Int(bgmVolume * 100))"
+            case .pinkNoise:
+                return "bgm-pinknoise-\(Int(bgmVolume * 100))"
+            case .custom:
+                let name = sanitizeFilename(bgmURL?.deletingPathExtension().lastPathComponent ?? "custom")
+                return "bgm-\(name)-\(Int(bgmVolume * 100))"
+            }
+        }()
+
+        let themeTag: String = {
+            switch backgroundTheme {
+            case .pureBlack: return "pureblack"
+            case .darkGradient: return "darkgradient"
+            case .charcoal: return "charcoal"
+            case .midnightPurple: return "midnight"
+            }
+        }()
+
+        let aspectTag: String = {
+            switch videoAspectRatio {
+            case .portrait9_16: return "9x16"
+            case .landscape16_9: return "16x9"
+            case .square1_1: return "1x1"
+            }
+        }()
+
+        let codecTag = videoCodec.rawValue // "hevc" 或 "h264"
+        let fpsTag = "\(frameRate)fps"
+        let resTag = videoResolution.label.lowercased()
+        let markTag = watermark.enabled ? "mark" : "nomark"
+
+        // 文件名只给主名（不含扩展名）：保存面板会按 allowedContentTypes 自动补扩展名，
+        // 避免出现 "...mark.mp4-<时间戳>.mp4" 这类重复扩展名。
+        let baseName: String
         switch exportMode {
-        case .audioSRT:
+        case .srt:
+            baseName = "\(title)-\(rateStr)-srt"
+        case .audio:
+            baseName = "\(title)-\(voiceCore)-\(voiceTag)-\(rateStr)-\(pauseStr)-\(bgmTag)-wav"
+        case .m4b:
+            baseName = "\(title)-\(voiceCore)-\(voiceTag)-\(rateStr)-\(pauseStr)-\(bgmTag)-m4b-aac"
+        case .video:
+            baseName = "\(title)-\(voiceCore)-\(voiceTag)-\(rateStr)-\(pauseStr)-\(bgmTag)-\(themeTag)-\(aspectTag)-\(resTag)-\(codecTag)-\(fpsTag)-\(markTag)"
+        }
+        switch exportMode {
+        case .srt:
+            panel.allowedContentTypes = [UTType(filenameExtension: "srt") ?? .data]
+        case .audio:
             panel.allowedContentTypes = [UTType(filenameExtension: "wav") ?? .audio]
-            panel.nameFieldStringValue = "BookStream-\(stamp).wav"
+        case .m4b:
+            panel.allowedContentTypes = [UTType(filenameExtension: "m4b") ?? .audio]
         case .video:
             panel.allowedContentTypes = [.mpeg4Movie]
-            panel.nameFieldStringValue = "BookStream-\(stamp).mp4"
         }
+        panel.nameFieldStringValue = sanitizeFilename("\(baseName)-\(stamp)")
         let response = panel.runModal()
         guard response == .OK, let url = panel.url else {
             log("已取消保存面板")
@@ -547,20 +711,30 @@ final class AppModel: ObservableObject {
         progressText = "准备中..."
         previewURL = nil
         errorMessage = nil
+        exportStartTime = Date()
+        lastLoggedPercent = -1
         cancelFlag.withLock { $0 = false }
         let cancelled: @Sendable () -> Bool = { [lock = cancelFlag] in
             lock.withLock { $0 }
         }
 
-        let voiceName: String
-        if let ai = selectedPiperVoice {
-            voiceName = "\(ai.displayName) [AI]"
-        } else {
-            voiceName = voices.first { $0.id == selectedVoiceID }?.name ?? "系统默认"
-        }
         log("开始导出 · 模式=\(exportMode.rawValue) · 输出=\(url.path)")
-        let resSuffix = exportMode == .video ? " · 分辨率=\(videoResolution.label)" : ""
-        log("  参数: 声音=\(voiceName) · 语速=\(String(format: "%.2f", speechRate)) · 高亮色=\(highlightColorDescription)\(resSuffix) · 复用音频=\(useExistingAudio ? (companionAudioURL?.lastPathComponent ?? "未选") : "否")")
+        let resSuffix = exportMode == .video
+            ? " · 分辨率=\(videoResolution.label) · 帧率=\(frameRate)fps"
+            : ""
+        let bgmLabel: String
+        switch bgmPreset {
+        case .none: bgmLabel = "关闭"
+        case .gentlePiano: bgmLabel = "舒缓和弦 (\(Int(bgmVolume * 100))%)"
+        case .oceanWaves: bgmLabel = "海浪波涛 (\(Int(bgmVolume * 100))%)"
+        case .rainAmbience: bgmLabel = "沉浸雨声 (\(Int(bgmVolume * 100))%)"
+        case .mountainStream: bgmLabel = "山间小溪 (\(Int(bgmVolume * 100))%)"
+        case .forestWind: bgmLabel = "林间微风 (\(Int(bgmVolume * 100))%)"
+        case .darkNoise: bgmLabel = "暗噪音 (\(Int(bgmVolume * 100))%)"
+        case .pinkNoise: bgmLabel = "平衡粉噪 (\(Int(bgmVolume * 100))%)"
+        case .custom: bgmLabel = "\(bgmURL?.lastPathComponent ?? "未选") (\(Int(bgmVolume * 100))%)"
+        }
+        log("  参数: 声音=\(voiceCore)\(voiceTag) · 语速=\(String(format: "%.2f", speechRate)) · 高亮色=\(highlightColorDescription)\(resSuffix) · BGM=\(bgmLabel) · 复用音频=\(useExistingAudio ? (companionAudioURL?.lastPathComponent ?? "未选") : "否")")
 
         pipelineTask = Task { [weak self] in
             guard let self else { return }
@@ -573,10 +747,84 @@ final class AppModel: ObservableObject {
         return String(format: "#%02X%02X%02X", Int(c.red * 255), Int(c.green * 255), Int(c.blue * 255))
     }
 
-    /// 当前选中的 AI 音色（nil = 使用系统声音）。
-    private var selectedPiperVoice: PiperVoice? {
+    /// 把「待保存文件名」清理为合法文件名：替换 `/ : \ ? * " < > | # %` 等
+    /// 在文件系统/保存面板里不安全或易歧义的字符为 `-`，折叠连续 `-`，去首尾空白与点。
+    private func sanitizeFilename(_ raw: String) -> String {
+        let forbidden = CharacterSet(charactersIn: "/:\\?*\"<>|#%\t\r\n")
+        let cleaned = raw.components(separatedBy: forbidden).joined(separator: " - ")
+        // 折叠连续分隔与空格
+        let parts = cleaned.split(whereSeparator: { $0 == "-" || $0 == " " })
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
+        return parts.trimmingCharacters(in: CharacterSet(charactersIn: " "))
+    }
+
+    /// 当前选中的 AI 音色（nil = 使用系统声音）。若选中的是“目录条目但尚未下载”，返回 nil。
+    var selectedPiperVoice: PiperVoice? {
         guard let id = selectedPiperVoiceID else { return nil }
-        return piperModels.first { $0.id == id }
+        // 直接命中已安装模型 id（en_US-lessac-medium）
+        if let m = piperModels.first(where: { $0.id == id }) { return m }
+        // 命中目录条目 id（en_US-lessac）→ 从已安装里按「语言-数据集」前缀找对应档位。
+        // 同一数据集可能装了多个质量档，优先选与当前「质量档」一致的那个，避免挑到无关档位。
+        if let e = piperCatalog.first(where: { $0.id == id }) {
+            let prefix = "\(e.language)-\(e.dataset)-"
+            if let q = piperModels.first(where: { $0.id == prefix + piperQuality.rawValue }) {
+                return q
+            }
+            return piperModels.first { $0.id.hasPrefix(prefix) }
+        }
+        return nil
+    }
+
+    /// 选中的目录条目（若选中值指向目录里的一个词条）。
+    var selectedCatalogEntry: PiperCatalogEntry? {
+        guard let id = selectedPiperVoiceID else { return nil }
+        return piperCatalog.first { $0.id == id }
+    }
+
+    /// 选中音色的“已显示名称”（渲染用 voiceCore；未下载时也用目录名）。
+    var selectedVoiceDisplayName: String? {
+        if let v = selectedPiperVoice { return v.displayName }
+        return selectedCatalogEntry?.displayName
+    }
+
+    /// 获取当前生效的背景音乐文件（若是内置预设，则即时合成对应时长的环绕音轨）。
+    private func resolveBGM(duration: Double) throws -> (url: URL, label: String, isTemp: Bool)? {
+        switch bgmPreset {
+        case .none:
+            return nil
+        case .custom:
+            guard let url = bgmURL else { return nil }
+            return (url, url.lastPathComponent, false)
+        case .gentlePiano:
+            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("bgm_piano_\(UUID().uuidString).wav")
+            try AudioEngine.generateProceduralBGM(preset: "piano", totalSeconds: duration + 10, outputURL: temp)
+            return (temp, "舒缓和弦氛围乐", true)
+        case .oceanWaves:
+            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("bgm_ocean_\(UUID().uuidString).wav")
+            try AudioEngine.generateProceduralBGM(preset: "ocean", totalSeconds: duration + 10, outputURL: temp)
+            return (temp, "海浪波涛", true)
+        case .rainAmbience:
+            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("bgm_rain_\(UUID().uuidString).wav")
+            try AudioEngine.generateProceduralBGM(preset: "rain", totalSeconds: duration + 10, outputURL: temp)
+            return (temp, "沉浸雨声", true)
+        case .mountainStream:
+            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("bgm_stream_\(UUID().uuidString).wav")
+            try AudioEngine.generateProceduralBGM(preset: "stream", totalSeconds: duration + 10, outputURL: temp)
+            return (temp, "山间小溪", true)
+        case .forestWind:
+            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("bgm_forest_\(UUID().uuidString).wav")
+            try AudioEngine.generateProceduralBGM(preset: "forest", totalSeconds: duration + 10, outputURL: temp)
+            return (temp, "林间微风", true)
+        case .darkNoise:
+            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("bgm_darknoise_\(UUID().uuidString).wav")
+            try AudioEngine.generateProceduralBGM(preset: "darkNoise", totalSeconds: duration + 10, outputURL: temp)
+            return (temp, "暗噪音", true)
+        case .pinkNoise:
+            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("bgm_pinknoise_\(UUID().uuidString).wav")
+            try AudioEngine.generateProceduralBGM(preset: "pinkNoise", totalSeconds: duration + 10, outputURL: temp)
+            return (temp, "平衡粉噪", true)
+        }
     }
 
     func cancelExport() {
@@ -605,73 +853,73 @@ final class AppModel: ObservableObject {
         }
 
         do {
+            // 若选中了「尚未下载」的 AI 音色，生成前先自动下载好，再进入渲染。
+            if let id = selectedPiperVoiceID, selectedPiperVoice == nil {
+                log("所选 AI 音色尚未下载，先生成前自动下载...")
+                _ = try await downloadCatalogEntryAndWait(id)
+                if cancelled() { return }
+            }
             switch (input, exportMode) {
-            case (.book(_, let sentences), .audioSRT):
-                log("开始 TTS 离线抓轨（\(sentences.count) 句）...")
-                let result = try await engine.renderBook(
-                    sentences: sentences,
-                    outputURL: wavURL,
-                    voiceIdentifier: selectedVoiceID,
-                    piperVoice: selectedPiperVoice,
-                    rate: speechRate,
-                    pauseScale: pauseScale,
-                    progress: { [weak self] done, total in
-                        self?.updateProgress(Double(done) / Double(max(total, 1)), text: "TTS 抓轨 \(done)/\(total) 句")
-                    },
-                    cancellation: cancelled
-                )
-                try SrtWriter.write(segments: result.segments, to: srtURL)
-                try AssWriter.write(segments: result.segments, highlight: highlightColor, to: assURL)
-                filesToCleanOnFailure = [wavURL, srtURL, assURL]
-                previewURL = nil
-                progress = 1
-                progressText = "完成"
-                let totalDur = result.segments.last?.end ?? 0
-                log("完成: \(wavURL.lastPathComponent) + \(srtURL.lastPathComponent) + \(assURL.lastPathComponent)")
-                log("  结果: \(result.segments.count) 句 / 音频 \(String(format: "%.2f", totalDur))s / WAV \(fileSize(wavURL)) / 总耗时 \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
+            case (.book(_, let sentences), let mode):
+                let chapterRanges = TextProcessor.detectChaptersFromSentences(sentences: sentences)
+                if exportByChapter && chapterRanges.count > 1 {
+                    log("已检测到 \(chapterRanges.count) 个章节，正在按章节分卷导出...")
+                    var allCreated: [URL] = []
+                    var totalOutputDur: Double = 0
+                    for (chIdx, item) in chapterRanges.enumerated() {
+                        if cancelled() { throw BookStreamError.cancelled }
+                        let chNum = String(format: "%02d", chIdx + 1)
+                        let chTitle = sanitizeFilename(item.chapter.title)
+                        let chBase = base.deletingLastPathComponent().appendingPathComponent("\(base.lastPathComponent) - [\(chNum)] \(chTitle)")
+                        let chSentences = Array(sentences[item.range])
+                        let tag = "第 \(chIdx + 1)/\(chapterRanges.count) 章"
+                        let (dur, mainURL, created) = try await renderSentenceBatch(
+                            sentences: chSentences,
+                            base: chBase,
+                            mode: mode,
+                            engine: engine,
+                            cancelled: cancelled,
+                            label: tag
+                        )
+                        allCreated.append(contentsOf: created)
+                        totalOutputDur += dur
+                        if chIdx == 0 && mode == .video { previewURL = mainURL }
+                    }
+                    filesToCleanOnFailure = allCreated
+                    progress = 1
+                    progressText = "完成"
+                    log("全部分卷导出完成: 共产出 \(chapterRanges.count) 卷（总耗时 \(String(format: "%.1f", Date().timeIntervalSince(t0)))s）")
+                } else {
+                    let (totalDur, mainURL, created) = try await renderSentenceBatch(
+                        sentences: sentences,
+                        base: base,
+                        mode: mode,
+                        engine: engine,
+                        cancelled: cancelled,
+                        label: nil
+                    )
+                    filesToCleanOnFailure = created
+                    previewURL = mainURL
+                    progress = 1
+                    progressText = "完成"
+                    let createdNames = created.map(\.lastPathComponent).joined(separator: " + ")
+                    log("完成: \(createdNames)")
+                    let mediaLabel: String
+                    switch mode {
+                    case .video: mediaLabel = "视频"
+                    case .m4b: mediaLabel = "M4B"
+                    case .audio: mediaLabel = "音频"
+                    case .srt: mediaLabel = "字幕"
+                    }
+                    log("  结果: \(sentences.count) 句 / \(mediaLabel) \(String(format: "%.2f", totalDur))s / \(fileSize(mainURL)) / 总耗时 \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
+                }
 
-            case (.book(_, let sentences), .video):
-                let tmpWAV = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("bookstream-\(UUID().uuidString).wav")
-                defer { try? FileManager.default.removeItem(at: tmpWAV) }
-                // 视频模式完全自包含：内部抓轨仅用于生成音频轨，不产出/依赖任何 .srt 文件
-                log("内部 TTS 抓轨（视频模式自动生成音频轨，不涉及 SRT）...")
-                let result = try await engine.renderBook(
-                    sentences: sentences,
-                    outputURL: tmpWAV,
-                    voiceIdentifier: selectedVoiceID,
-                    piperVoice: selectedPiperVoice,
-                    rate: speechRate,
-                    pauseScale: pauseScale,
-                    progress: { [weak self] done, total in
-                        self?.updateProgress(Double(done) / Double(max(total, 1)), text: "TTS 抓轨 \(done)/\(total) 句")
-                    },
-                    cancellation: cancelled
-                )
-                log("视频渲染（复用合成音频，30fps \(videoResolution.label)）...")
-                let renderer = VideoRenderer()
-                filesToCleanOnFailure = [mp4URL]
-                try await renderer.render(
-                    audioURL: tmpWAV,
-                    segments: result.segments,
-                    outputURL: mp4URL,
-                    style: CaptionStyle(highlight: highlightColor),
-                    resolution: videoResolution,
-                    watermark: watermark,
-                    progress: { [weak self] p in
-                        self?.updateProgress(p, text: "视频渲染 \(Int(p * 100))%")
-                    },
-                    cancellation: cancelled
-                )
-                previewURL = mp4URL
-                progress = 1
-                progressText = "完成"
-                let totalDur = result.segments.last?.end ?? 0
-                log("完成: \(mp4URL.lastPathComponent)")
-                log("  结果: \(result.segments.count) 句 / 视频 \(String(format: "%.2f", totalDur))s / MP4 \(fileSize(mp4URL)) / 总耗时 \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
+            case (.subtitles, .srt):
+                throw BookStreamError.unsupportedFile("字幕输入已自带 SRT，无需 SRT 模式")
 
-            case (.subtitles(_, let entries), .audioSRT):
+            case (.subtitles(_, let entries), .audio):
                 log("开始字幕旁白 TTS 抓轨（按原时间轴放置）...")
+                let ttsStart = Date()
                 let result = try await engine.renderSubtitleAudio(
                     entries: entries,
                     outputURL: wavURL,
@@ -685,13 +933,43 @@ final class AppModel: ObservableObject {
                     cancellation: cancelled
                 )
                 for warning in result.warnings { log("⚠︎ " + warning) }
+                logPhaseCompletion(phase: "音频", elapsed: Date().timeIntervalSince(ttsStart), mediaDuration: result.segments.last?.end ?? 0)
                 try SrtWriter.write(segments: result.segments, to: srtURL)
                 try AssWriter.write(segments: result.segments, highlight: highlightColor, to: assURL)
                 filesToCleanOnFailure = [wavURL, srtURL, assURL]
+                previewURL = wavURL
                 progress = 1
                 progressText = "完成"
                 log("完成: \(wavURL.lastPathComponent) + \(srtURL.lastPathComponent) + \(assURL.lastPathComponent)")
                 log("  结果: \(result.segments.count) 条 / 音频 \(String(format: "%.2f", result.segments.last?.end ?? 0))s / 总耗时 \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
+
+            case (.subtitles(_, let entries), .m4b):
+                log("开始字幕旁白 TTS 抓轨并封装 M4B 有声书...")
+                let ttsStart = Date()
+                let result = try await engine.renderSubtitleAudio(
+                    entries: entries,
+                    outputURL: wavURL,
+                    voiceIdentifier: selectedVoiceID,
+                    piperVoice: selectedPiperVoice,
+                    rate: speechRate,
+                    overflowPolicy: subtitleOverflowPolicy,
+                    progress: { [weak self] done, total in
+                        self?.updateProgress(Double(done) / Double(max(total, 1)), text: "旁白抓轨 \(done)/\(total) 条")
+                    },
+                    cancellation: cancelled
+                )
+                for warning in result.warnings { log("⚠︎ " + warning) }
+                logPhaseCompletion(phase: "音频", elapsed: Date().timeIntervalSince(ttsStart), mediaDuration: result.segments.last?.end ?? 0)
+                try SrtWriter.write(segments: result.segments, to: srtURL)
+                try AssWriter.write(segments: result.segments, highlight: highlightColor, to: assURL)
+                let m4bURL = base.appendingPathExtension("m4b")
+                try AudioEngine.convertWavToM4b(wavURL: wavURL, outputURL: m4bURL)
+                filesToCleanOnFailure = [wavURL, srtURL, assURL, m4bURL]
+                previewURL = m4bURL
+                progress = 1
+                progressText = "完成"
+                log("完成: \(m4bURL.lastPathComponent) + \(srtURL.lastPathComponent) + \(assURL.lastPathComponent)")
+                log("  结果: \(result.segments.count) 条 / M4B \(fileSize(m4bURL)) / 总耗时 \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
 
             case (.subtitles(_, let entries), .video):
                 // 解耦：若用户已提供「已有音频 + 字幕」，直接复用其时间轴渲染，完全跳过 TTS
@@ -705,28 +983,32 @@ final class AppModel: ObservableObject {
                             endFrame: Int64(($0.end * AudioFormat.sampleRate).rounded())
                         )
                     }
+                    let totalDur = entries.last?.end ?? 0
+                    log("视频渲染（\(frameRate)fps \(videoResolution.label)，主题=\(backgroundTheme.label)）...")
+                    let renderStart = Date()
                     let renderer = VideoRenderer()
                     filesToCleanOnFailure = [mp4URL]
                     try await renderer.render(
                         audioURL: companion,
                         segments: segments,
                         outputURL: mp4URL,
-                        style: CaptionStyle(highlight: highlightColor),
+                        style: CaptionStyle(highlight: highlightColor, theme: backgroundTheme, showVisualizer: showVisualizer, font: subtitleFont, enableKaraoke: enableKaraoke),
                         resolution: videoResolution,
+                        codec: videoCodec,
                         watermark: watermark,
+                        fps: frameRate,
                         progress: { [weak self] p in
                             self?.updateProgress(p, text: "视频渲染 \(Int(p * 100))%")
                         },
                         cancellation: cancelled
                     )
+                    logPhaseCompletion(phase: "视频渲染", elapsed: Date().timeIntervalSince(renderStart), mediaDuration: totalDur)
                 } else {
-                    let tmpWAV = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("bookstream-\(UUID().uuidString).wav")
-                    defer { try? FileManager.default.removeItem(at: tmpWAV) }
-                    log("内部 TTS 抓轨（视频模式自动生成音频轨，不涉及 SRT）...")
+                    log("开始字幕旁白 TTS 抓轨（按原时间轴放置，视频音频轨复用）...")
+                    let ttsStart = Date()
                     let result = try await engine.renderSubtitleAudio(
                         entries: entries,
-                        outputURL: tmpWAV,
+                        outputURL: wavURL,
                         voiceIdentifier: selectedVoiceID,
                         piperVoice: selectedPiperVoice,
                         rate: speechRate,
@@ -737,20 +1019,34 @@ final class AppModel: ObservableObject {
                         cancellation: cancelled
                     )
                     for warning in result.warnings { self.log("⚠︎ " + warning) }
+                    let totalDur = result.segments.last?.end ?? 0
+                    logPhaseCompletion(phase: "音频", elapsed: Date().timeIntervalSince(ttsStart), mediaDuration: totalDur)
+                    try SrtWriter.write(segments: result.segments, to: srtURL)
+                    try AssWriter.write(segments: result.segments, highlight: highlightColor, to: assURL)
+                    if let bgmInfo = try resolveBGM(duration: totalDur) {
+                        log("正在混入背景音乐（\(bgmInfo.label)，音量=\(Int(bgmVolume * 100))%，侧链压限=\(enableDucking ? "开" : "关")）...")
+                        try AudioEngine.mixBGM(voiceWAVURL: wavURL, bgmURL: bgmInfo.url, outputURL: wavURL, bgmVolume: bgmVolume, enableDucking: enableDucking)
+                        if bgmInfo.isTemp { try? FileManager.default.removeItem(at: bgmInfo.url) }
+                    }
+                    log("视频渲染（\(frameRate)fps \(videoResolution.label)，主题=\(backgroundTheme.label)）...")
+                    let renderStart = Date()
                     let renderer = VideoRenderer()
-                    filesToCleanOnFailure = [mp4URL]
+                    filesToCleanOnFailure = [wavURL, srtURL, assURL, mp4URL]
                     try await renderer.render(
-                        audioURL: tmpWAV,
+                        audioURL: wavURL,
                         segments: result.segments,
                         outputURL: mp4URL,
-                        style: CaptionStyle(highlight: highlightColor),
+                        style: CaptionStyle(highlight: highlightColor, theme: backgroundTheme, showVisualizer: showVisualizer, font: subtitleFont, enableKaraoke: enableKaraoke),
                         resolution: videoResolution,
+                        codec: videoCodec,
                         watermark: watermark,
+                        fps: frameRate,
                         progress: { [weak self] p in
                             self?.updateProgress(p, text: "视频渲染 \(Int(p * 100))%")
                         },
                         cancellation: cancelled
                     )
+                    logPhaseCompletion(phase: "视频渲染", elapsed: Date().timeIntervalSince(renderStart), mediaDuration: totalDur)
                 }
                 previewURL = mp4URL
                 progress = 1
@@ -776,9 +1072,131 @@ final class AppModel: ObservableObject {
         cancelFlag.withLock { $0 = false }
     }
 
+    /// 句子批次渲染辅助：支持全书渲染与按章节分卷独立渲染
+    private func renderSentenceBatch(
+        sentences: [Sentence],
+        base: URL,
+        mode: ExportMode,
+        engine: AudioEngine,
+        cancelled: @Sendable @escaping () -> Bool,
+        label: String? = nil
+    ) async throws -> (mediaDuration: Double, mainOutputURL: URL, allOutputs: [URL]) {
+        let wavURL = base.appendingPathExtension("wav")
+        let srtURL = base.appendingPathExtension("srt")
+        let assURL = base.appendingPathExtension("ass")
+        let mp4URL = base.appendingPathExtension("mp4")
+        let prefix = label != nil ? "[\(label!)] " : ""
+
+        if mode == .srt {
+            let han = Self.hanRatio(of: sentences.prefix(200).map(\.text).joined())
+            let cps = han > 0.2 ? 4.8 : 16.0
+            let rateScale = Double(0.5 / max(speechRate, 0.1))
+            var cursor = 0.0
+            let estimated = sentences.map { s -> TimedSegment in
+                let dur = Double(s.text.count) / cps * rateScale
+                let seg = TimedSegment(id: s.id, text: s.text,
+                                       startFrame: Int64((cursor * AudioFormat.sampleRate).rounded()),
+                                       endFrame: Int64(((cursor + dur) * AudioFormat.sampleRate).rounded()))
+                cursor += dur + s.pauseAfter
+                return seg
+            }
+            try SrtWriter.write(segments: estimated, to: srtURL)
+            try AssWriter.write(segments: estimated, highlight: highlightColor, to: assURL)
+            let dur = estimated.last?.end ?? 0
+            return (dur, srtURL, [srtURL, assURL])
+        }
+
+        log("\(prefix)开始 TTS 离线抓轨（\(sentences.count) 句）...")
+        let ttsStart = Date()
+        phaseStartTime = Date()
+        lastLoggedPercent = -1
+        let result = try await engine.renderBook(
+            sentences: sentences,
+            outputURL: wavURL,
+            voiceIdentifier: selectedVoiceID,
+            piperVoice: selectedPiperVoice,
+            rate: speechRate,
+            pauseScale: pauseScale,
+            progress: { [weak self] done, total in
+                self?.updateProgress(Double(done) / Double(max(total, 1)), text: "\(prefix)TTS 抓轨 \(done)/\(total) 句")
+            },
+            cancellation: cancelled
+        )
+        let totalDur = result.segments.last?.end ?? 0
+        logPhaseCompletion(phase: "\(prefix)音频", elapsed: Date().timeIntervalSince(ttsStart), mediaDuration: totalDur)
+        try SrtWriter.write(segments: result.segments, to: srtURL)
+        try AssWriter.write(segments: result.segments, highlight: highlightColor, to: assURL)
+        let chapters = TextProcessor.detectChapters(segments: result.segments)
+        let chURL = base.appendingPathExtension("chapters.txt")
+        var outputs = [wavURL, srtURL, assURL]
+        if !chapters.isEmpty {
+            try ChapterWriter.write(chapters: chapters, to: chURL)
+            outputs.append(chURL)
+            log("  \(prefix)章节: 自动识别并导出 \(chapters.count) 个章节标记（已写出 \(chURL.lastPathComponent)）")
+        }
+
+        if let bgmInfo = try resolveBGM(duration: totalDur) {
+            log("  \(prefix)正在混入背景音乐（\(bgmInfo.label)，音量=\(Int(bgmVolume * 100))%，侧链压限=\(enableDucking ? "开" : "关")）...")
+            try AudioEngine.mixBGM(voiceWAVURL: wavURL, bgmURL: bgmInfo.url, outputURL: wavURL, bgmVolume: bgmVolume, enableDucking: enableDucking)
+            if bgmInfo.isTemp { try? FileManager.default.removeItem(at: bgmInfo.url) }
+        }
+
+        if mode == .audio {
+            return (totalDur, wavURL, outputs)
+        }
+
+        if mode == .m4b {
+            let m4bURL = base.appendingPathExtension("m4b")
+            log("  \(prefix)正在封装 M4B 高品质 AAC 有声书...")
+            try AudioEngine.convertWavToM4b(wavURL: wavURL, outputURL: m4bURL)
+            outputs.append(m4bURL)
+            return (totalDur, m4bURL, outputs)
+        }
+
+        // 视频模式
+        log("\(prefix)视频渲染（\(frameRate)fps \(videoResolution.label)，多核并发流水线，主题=\(backgroundTheme.label)）...")
+        let renderStart = Date()
+        phaseStartTime = Date()
+        lastLoggedPercent = -1
+        let renderer = VideoRenderer()
+        try await renderer.render(
+            audioURL: wavURL,
+            segments: result.segments,
+            outputURL: mp4URL,
+            style: CaptionStyle(highlight: highlightColor, theme: backgroundTheme, showVisualizer: showVisualizer, font: subtitleFont, enableKaraoke: enableKaraoke),
+            resolution: videoResolution,
+            codec: videoCodec,
+            watermark: watermark,
+            fps: frameRate,
+            progress: { [weak self] p in
+                self?.updateProgress(p, text: "\(prefix)视频渲染 \(Int(p * 100))%")
+            },
+            cancellation: cancelled
+        )
+        logPhaseCompletion(phase: "\(prefix)视频渲染", elapsed: Date().timeIntervalSince(renderStart), mediaDuration: totalDur)
+        outputs.append(mp4URL)
+        return (totalDur, mp4URL, outputs)
+    }
+
     private func updateProgress(_ p: Double, text: String) {
         progress = p
         progressText = text
+        // 每跨越 10% 边界记录一次：已用时间 + 按当前阶段实际速度推算的剩余时间
+        // （0% 不记：阶段切换时的「0%」与阶段完成日志重复）
+        let pct = Int(p * 100)
+        let bucket = pct / 10 * 10
+        if bucket != lastLoggedPercent, bucket >= 10 {
+            lastLoggedPercent = bucket
+            let elapsed = Date().timeIntervalSince(phaseStartTime)
+            let remaining = p > 0.01 ? elapsed / p - elapsed : 0
+            log("\(text) · 已用 \(Self.formatDuration(elapsed)) · 剩余约 \(Self.formatDuration(remaining))")
+        }
+    }
+
+    /// 阶段完成日志：实际用时 + 产出时长 + 相对实时的速度倍数。
+    private func logPhaseCompletion(phase: String, elapsed: TimeInterval, mediaDuration: Double) {
+        let ratio = elapsed > 0 ? mediaDuration / elapsed : 0
+        log("\(phase)完成: 用时 \(Self.formatDuration(elapsed)) · 产出 \(String(format: "%.1f", mediaDuration))s 内容 · 实时率 \(String(format: "%.1f", ratio))×")
     }
 
     private func fileSize(_ url: URL) -> String {
@@ -798,6 +1216,27 @@ final class AppModel: ObservableObject {
         let line = "[\(Self.logTimeFormatter.string(from: Date()))] \(message)"
         logLines.append(line)
         if logLines.count > 400 { logLines.removeFirst(logLines.count - 400) }
+    }
+
+    /// 把解析期对原文的标点修复输出到日志：汇总统计 + 前若干条明细样例。
+    func logTextFixes(_ fixes: [TextFix]) {
+        guard !fixes.isEmpty else { return }
+        let order: [TextFixKind] = [.stripBoilerplate, .skipTOC, .addPeriod, .fixBoundary, .collapseDuplicate, .splitLong]
+        let summary = order
+            .compactMap { kind in
+                let n = fixes.filter { $0.kind == kind }.count
+                return n > 0 ? "\(kind.rawValue) \(n) 处" : nil
+            }
+            .joined(separator: " · ")
+        log("已调整原文: \(summary)（共 \(fixes.count) 处；仅影响解析结果，不修改原文件）")
+        for f in fixes.prefix(5) {
+            let original = f.original.count > 24 ? f.original.prefix(24) + "…" : f.original
+            let repaired = f.repaired.count > 24 ? f.repaired.prefix(24) + "…" : f.repaired
+            log("  · 段落\(f.paraIndex) \(f.kind.rawValue): 「\(original)」→「\(repaired)」")
+        }
+        if fixes.count > 5 {
+            log("  …其余 \(fixes.count - 5) 处省略（共 \(fixes.count) 处）")
+        }
     }
 
     /// 复制全部日志到剪贴板（供粘贴给 AI 进行 debug）。
@@ -845,6 +1284,7 @@ struct ContentView: View {
     // 左侧控制区滚动状态（可滚动区 0...1 的进度 + 是否溢出需要滚动条）
     @State private var leftScrollFraction: Double = 0
     @State private var leftScrollHasOverflow: Bool = false
+    @State private var showAIVoicePanel: Bool = false
 
     var body: some View {
         HSplitView {
@@ -865,6 +1305,24 @@ struct ContentView: View {
             Button("好") { model.errorMessage = nil }
         } message: {
             Text(model.errorMessage ?? "")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .bookStreamPickFile)) { _ in
+            pickFile()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .bookStreamReloadFile)) { _ in
+            if let url = model.inputURL {
+                Task { await model.loadInput(url: url) }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .bookStreamStartExport)) { _ in
+            if !model.isProcessing && model.inputKind != nil {
+                model.startExport()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .bookStreamCancelExport)) { _ in
+            if model.isProcessing {
+                model.cancelExport()
+            }
         }
     }
 
@@ -891,26 +1349,51 @@ struct ContentView: View {
     /// 左栏可滚动内容（窗口高度不足时用进度条上下滚动定位下方被隐藏的控件）。
     private var leftScrollContent: some View {
         VStack(alignment: .leading, spacing: 14) {
-            dropZone
+            topActionSection
             infoBox
+            Toggle("智能解析（修复标点/合并折行）", isOn: $model.smartParse)
+                .font(.caption)
+            Toggle("拆分超长句（>60 字）", isOn: $model.splitLongSentences)
+                .font(.caption)
+                .onChange(of: model.smartParse) { _ in
+                    // 开关变化后重新解析当前输入，保证日志/句数即时更新
+                    if let url = model.inputURL {
+                        Task { await model.loadInput(url: url) }
+                    }
+                }
+                .onChange(of: model.splitLongSentences) { _ in
+                    if let url = model.inputURL {
+                        Task { await model.loadInput(url: url) }
+                    }
+                }
             Divider()
             voicePicker
             aiVoiceSection
             rateSlider
+            bgmSection
             Divider()
             modePicker
             if case .subtitles = model.inputKind {
                 overflowPolicyPicker
             }
+            colorPalette
             if model.exportMode == .video {
-                colorPalette
-                resolutionPicker
+                themePicker
+                fontPicker
+                karaokeSection
+                visualizerSection
+                aspectRatioPicker
+                qualityPicker
+                codecPicker
+                fpsPicker
                 watermarkSection
                 if case .subtitles = model.inputKind {
                     companionAudioSection
                 }
             }
-            actionButtons
+            if case .book = model.inputKind {
+                chapterExportSection
+            }
             HStack {
                 Text(Self.versionString)
                     .font(.caption2)
@@ -936,109 +1419,207 @@ struct ContentView: View {
     /// 本地 AI 音色（Piper）选择与安装。
     private var aiVoiceSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("AI 音色（本地 · 离线）").font(.caption).foregroundStyle(.secondary)
-
-            if model.piperEngineInstalled {
-                HStack {
-                    Picker("AI 音色", selection: Binding(
-                        get: { model.selectedPiperVoiceID },
-                        set: { newID in
-                            model.selectedPiperVoiceID = newID
-                            if let voice = model.piperModels.first(where: { $0.id == newID }) {
-                                model.log("切换 AI 音色: \(voice.displayName) · \(voice.language)")
-                            } else {
-                                model.log("切换为系统声音")
-                            }
-                        }
-                    )) {
-                        Text("使用系统声音").tag(String?.none)
-                        ForEach(model.piperModels) { v in
-                            Text("\(v.displayName) · \(v.language)").tag(v.id as String?)
-                        }
+            // —— 入口头：点击展开/收起整个音色面板 ——
+            HStack(spacing: 6) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showAIVoicePanel.toggle()
                     }
-                    .labelsHidden()
-                    Spacer()
-                    Button("试听") { model.previewPiperVoice() }
-                        .font(.caption)
-                        .disabled(model.selectedPiperVoiceID == nil)
+                } label: {
+                    HStack(spacing: 6) {
+                        Text("AI 音色（本地 · 离线）")
+                            .font(.caption)
+                            .foregroundStyle(.primary)
+                        Spacer()
+                        Text(aiVoiceSummary)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Image(systemName: showAIVoicePanel ? "chevron.up" : "chevron.down")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
+                .buttonStyle(.plain)
 
-                if model.piperModels.isEmpty {
-                    Text("尚未下载音色模型，可下载中/英文各一个（约 20~125MB，一次性）")
+                if model.selectedPiperVoice != nil && !showAIVoicePanel {
+                    Button("试听") { model.previewPiperVoice() }
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .buttonStyle(.bordered)
+                        .disabled(model.isModelDownloading)
                 }
-                HStack(spacing: 10) {
-                    if model.isModelDownloading {
-                        Text("下载中...").font(.caption).foregroundStyle(.secondary)
-                    } else {
-                        Button("下载英文音色（LibriTTS-R 真人朗读）") { model.downloadPiperModel(language: "en_US", dataset: "libritts_r") }
-                            .font(.caption)
-                        Button("下载中文音色") { model.downloadPiperModel(language: "zh_CN", dataset: "huayan") }
-                            .font(.caption)
+            }
+
+            if showAIVoicePanel {
+                if model.piperEngineInstalled {
+                    aiVoiceInstalledPanel
+                } else {
+                    // 引擎未安装：只给安装 + 刷新
+                    HStack(spacing: 10) {
+                        if model.isPiperInstalling {
+                            Text("正在安装引擎...").font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Button("安装本地 AI 引擎（一次性，约 150MB）") { model.installPiperEngine() }
+                                .font(.caption)
+                        }
                         Button("刷新") { model.refreshPiper(forceCatalog: true) }
                             .font(.caption)
                     }
+                    Text("引擎为本地神经网络 TTS（piper-tts），安装后合成完全离线")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
-                .disabled(model.piperEngineInstalled == false)
-                // 下载质量档位可选（并非每个音色都有所有档位；下载失败会自动回退到低档）
-                HStack(spacing: 8) {
-                    Text("质量档").font(.caption).foregroundStyle(.secondary)
-                    Picker("质量", selection: $model.piperQuality) {
-                        ForEach(AppModel.PiperQuality.allCases) { q in
-                            Text(q.label).tag(q)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(maxWidth: 180)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                // 完整音色目录：按名称选择任一下载（来源 rhasspy/piper-voices）
-                Divider()
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("更多音色（按名称选择下载）").font(.caption).foregroundStyle(.secondary)
-                    if model.catalogLoadFailed {
-                        Text("在线目录加载失败（网络）——可先用上方快捷按钮，稍后点「刷新」重试")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    } else if model.piperCatalog.isEmpty {
-                        Text("正在加载在线目录...").font(.caption2).foregroundStyle(.secondary)
-                    } else {
-                        Picker("音色", selection: $model.selectedCatalogEntryID) {
-                            ForEach(model.piperCatalog) { e in
-                                Text(e.displayName).tag(e.id as String?)
-                            }
-                        }
-                        .labelsHidden()
-                        HStack(spacing: 8) {
-                            Button("下载该音色") { model.downloadCatalogEntry() }
-                                .font(.caption)
-                            Text(model.catalogSelectionDescription)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                HStack(spacing: 10) {
-                    if model.isPiperInstalling {
-                        Text("正在安装引擎...").font(.caption).foregroundStyle(.secondary)
-                    } else {
-                        Button("安装本地 AI 引擎（一次性，约 150MB）") { model.installPiperEngine() }
-                            .font(.caption)
-                    }
-                    Button("刷新") { model.refreshPiper(forceCatalog: true) }
-                        .font(.caption)
-                }
-                Text("引擎为本地神经网络 TTS（piper-tts），安装后合成完全离线")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
             }
         }
+    }
+
+    /// 入口头摘要：当前所选 AI 音色（或“未下载/使用系统声音”）。
+    private var aiVoiceSummary: String {
+        if let v = model.selectedPiperVoice { return "\(v.displayName) · \(v.language)" }
+        if let e = model.selectedCatalogEntry { return "\(e.displayName) · 未下载" }
+        return "使用系统声音"
+    }
+
+    /// 引擎已安装：统一音色列表 + 选中音色的操作条。
+    private var aiVoiceInstalledPanel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // 统一音色列表（已安装打勾；目录未安装标“未下载”）
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    aiVoiceRow(
+                        label: "使用系统声音",
+                        installed: true,
+                        selected: model.selectedPiperVoiceID == nil
+                    ) {
+                        model.selectedPiperVoiceID = nil
+                        model.log("切换为系统声音")
+                        withAnimation(.easeInOut(duration: 0.2)) { showAIVoicePanel = false }
+                    } trailing: {
+                        EmptyView()
+                    }
+
+                    ForEach(model.piperModels) { v in
+                        aiVoiceRow(
+                            label: "\(v.displayName) · \(v.language)",
+                            installed: true,
+                            selected: model.selectedPiperVoiceID == v.id
+                        ) { [weak model] in
+                            model?.selectedPiperVoiceID = v.id
+                            model?.log("切换 AI 音色: \(v.displayName) · \(v.language)")
+                            withAnimation(.easeInOut(duration: 0.2)) { showAIVoicePanel = false }
+                        } trailing: {
+                            Image(systemName: "checkmark")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    ForEach(model.piperCatalog) { e in
+                        // 已安装的目录条目不重复列出
+                        let installed = model.piperModels.contains { $0.id.hasPrefix("\(e.language)-\(e.dataset)-") }
+                        if !installed {
+                            aiVoiceRow(
+                                label: "\(e.displayName) · \(e.language) · 未下载",
+                                installed: false,
+                                selected: model.selectedPiperVoiceID == e.id
+                            ) { [weak model] in
+                                model?.selectedPiperVoiceID = e.id
+                                model?.log("已选未下载音色 \(e.displayName) · 生成时自动下载")
+                                withAnimation(.easeInOut(duration: 0.2)) { showAIVoicePanel = false }
+                            } trailing: {
+                                Text("未下载")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+            .frame(maxHeight: 170)
+
+            if model.piperCatalog.isEmpty && !model.catalogLoadFailed {
+                Text("正在加载在线音色目录...").font(.caption2).foregroundStyle(.secondary)
+            }
+            if model.catalogLoadFailed {
+                Text("在线目录加载失败（网络），点「刷新」重试").font(.caption2).foregroundStyle(.secondary)
+            }
+
+            // 选中音色的操作条：试听 / 删除（已装）；下载（未装）；未选提示
+            HStack(spacing: 8) {
+                if let v = model.selectedPiperVoice {
+                    Button("试听") { model.previewPiperVoice() }
+                        .font(.caption)
+                        .disabled(model.isModelDownloading)
+                    Button("删除") { model.deletePiperVoice(v) }
+                        .font(.caption)
+                        .disabled(model.isModelDownloading)
+                } else if model.selectedPiperVoiceID != nil {
+                    Button("下载") { model.startSelectedVoiceDownload() }
+                        .font(.caption)
+                        .disabled(model.isModelDownloading)
+                    Text("选中未下载，生成时也会自动下载")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("未选择 AI 音色，将用系统声音")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if model.isModelDownloading {
+                    Text("下载中...").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("刷新") { model.refreshPiper(forceCatalog: true) }
+                    .font(.caption)
+            }
+
+            // 下载质量档位
+            HStack(spacing: 8) {
+                Text("质量档").font(.caption).foregroundStyle(.secondary)
+                Picker("质量", selection: $model.piperQuality) {
+                    ForEach(AppModel.PiperQuality.allCases) { q in
+                        Text(q.label).tag(q)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 180)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// 音色列表单行：高亮当前选中的；点击选中。
+    private func aiVoiceRow(
+        label: String,
+        installed: Bool,
+        selected: Bool,
+        onSelect: @escaping () -> Void,
+        @ViewBuilder trailing: () -> some View
+    ) -> some View {
+        Button(action: onSelect) {
+            HStack(spacing: 6) {
+                Text(label)
+                    .font(.caption2)
+                    .foregroundStyle(selected ? Color.accentColor : .primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                trailing()
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(selected ? Color.accentColor.opacity(0.12) : Color.clear)
+            )
+            .contentShape(Rectangle())
+            .opacity(installed ? 1 : 0.75)
+        }
+        .buttonStyle(.plain)
     }
 
     /// 版本信息：如 v1.0.0(20260818_1146)。
@@ -1047,30 +1628,71 @@ struct ContentView: View {
         return "v\(AppModel.appVersion)(\(build))"
     }
 
-    private var dropZone: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "books.vertical")
-                .font(.system(size: 36))
-                .foregroundStyle(.secondary)
-            Text("拖入 .txt / .epub / .srt / .ass / .ssa")
-                .font(.headline)
-            Text("或")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Button("选择文件...") { pickFile() }
+    private var topActionSection: some View {
+        HStack(spacing: 8) {
+            // 紧凑型选择文件 / 拖放区域 (⌘I)
+            Button {
+                pickFile()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: model.inputKind == nil ? "doc.badge.plus" : "doc.text.fill")
+                        .font(.system(size: 14))
+                        .foregroundStyle(model.inputKind == nil ? .secondary : Color.accentColor)
+                    Text(model.inputKind == nil ? "选择或拖入文件 (⌘I)..." : (model.inputURL?.lastPathComponent ?? "已导入文件"))
+                        .font(.callout)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut("i", modifiers: .command)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(
+                        model.inputKind == nil ? Color.secondary.opacity(0.35) : Color.accentColor.opacity(0.6),
+                        style: StrokeStyle(lineWidth: 1.5, dash: model.inputKind == nil ? [4] : [])
+                    )
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(model.inputKind == nil ? 0.04 : 0.08)))
+            )
+            .dropDestination(for: URL.self) { urls, _ in
+                guard let url = urls.first else { return false }
+                Task { await model.loadInput(url: url) }
+                return true
+            }
+
+            // 开始生成 (⌘E) / 取消按钮 (⌘.) 紧靠导入框
+            if model.isProcessing {
+                Button(role: .destructive) {
+                    model.cancelExport()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "stop.fill")
+                        Text("取消 (⌘.)")
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 7)
+                }
                 .buttonStyle(.borderedProminent)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 28)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(style: StrokeStyle(lineWidth: 2, dash: [6]))
-                .foregroundStyle(.tertiary)
-        )
-        .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first else { return false }
-            Task { await model.loadInput(url: url) }
-            return true
+                .tint(.red)
+                .keyboardShortcut(".", modifiers: .command)
+            } else {
+                Button {
+                    model.startExport()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "play.fill")
+                        Text("开始生成 (⌘E)")
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 7)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut("e", modifiers: .command)
+                .disabled(model.inputKind == nil)
+            }
         }
     }
 
@@ -1132,6 +1754,29 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private var themePicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("背景主题").font(.caption).foregroundStyle(.secondary)
+            Picker("背景主题", selection: $model.backgroundTheme) {
+                ForEach(BackgroundTheme.allCases) { t in
+                    Text(t.label).tag(t)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+        }
+    }
+
+    private var visualizerSection: some View {
+        Toggle("声波动态挂件（底部频带动效）", isOn: $model.showVisualizer)
+            .font(.caption)
+    }
+
+    private var chapterExportSection: some View {
+        Toggle("按章节分卷导出（检测到多章时拆分）", isOn: $model.exportByChapter)
+            .font(.caption)
     }
 
     /// 水印某字段的可写绑定：改动即整体更新并持久化。
@@ -1238,13 +1883,67 @@ struct ContentView: View {
         }
     }
 
-    /// 视频输出分辨率选择（480p/720p/1080p/4K）。
-    private var resolutionPicker: some View {
+    /// 自定义字幕字体选择。
+    private var fontPicker: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("输出分辨率").font(.caption).foregroundStyle(.secondary)
-            Picker("分辨率", selection: $model.videoResolution) {
-                ForEach(VideoResolution.all, id: \.self) { r in
-                    Text(r.label).tag(r)
+            Text("字幕字体").font(.caption).foregroundStyle(.secondary)
+            Picker("字体", selection: $model.subtitleFont) {
+                ForEach(SubtitleFont.allCases) { f in
+                    Text(f.label).tag(f)
+                }
+            }
+            .labelsHidden()
+        }
+    }
+
+    /// 画幅比例选择（16:9 横屏 / 9:16 竖屏 / 1:1 方形）。
+    private var aspectRatioPicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("画幅比例").font(.caption).foregroundStyle(.secondary)
+            Picker("比例", selection: $model.videoAspectRatio) {
+                ForEach(VideoAspectRatio.allCases) { a in
+                    Text(a.label).tag(a)
+                }
+            }
+            .labelsHidden()
+        }
+    }
+
+    /// 视频输出画质选择（480p/720p/1080p/4K）。
+    private var qualityPicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("画质分辨率").font(.caption).foregroundStyle(.secondary)
+            Picker("画质", selection: $model.videoQuality) {
+                ForEach(VideoQuality.allCases) { q in
+                    Text(q.label).tag(q)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+        }
+    }
+
+    /// 视频编码格式选择（H.264 / HEVC）。
+    private var codecPicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("视频编码").font(.caption).foregroundStyle(.secondary)
+            Picker("编码", selection: $model.videoCodec) {
+                ForEach(VideoCodec.allCases) { c in
+                    Text(c.label).tag(c)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+        }
+    }
+
+    /// 帧率选择（24/25/30/60）。
+    private var fpsPicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("帧率").font(.caption).foregroundStyle(.secondary)
+            Picker("帧率", selection: $model.frameRate) {
+                ForEach([24, 25, 30, 60], id: \.self) { f in
+                    Text("\(f) fps").tag(f)
                 }
             }
             .labelsHidden()
@@ -1318,34 +2017,113 @@ struct ContentView: View {
         }
     }
 
+    /// 字级卡拉OK动态点亮动效（朗读时实时变色高亮）
+    private var karaokeSection: some View {
+        Toggle("字级卡拉OK点亮动效", isOn: $model.enableKaraoke)
+            .font(.caption)
+    }
+
+    /// 背景音乐（BGM）混音与智能侧链避让压限配置。
+    private var bgmSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("背景音乐 (BGM)").font(.caption).foregroundStyle(.secondary)
+            Picker("背景音乐", selection: $model.bgmPreset) {
+                ForEach(AppModel.BGMPreset.allCases) { p in
+                    Text(p.rawValue).tag(p)
+                }
+            }
+            .labelsHidden()
+
+            if model.bgmPreset != .none {
+                if model.bgmPreset == .custom {
+                    HStack {
+                        Text(model.bgmURL?.lastPathComponent ?? "未选择音乐文件")
+                            .font(.caption)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Button("选择音乐...") { pickBGM() }
+                            .font(.caption)
+                    }
+                }
+                HStack {
+                    Text("BGM 音量").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        model.bgmVolume = max(0.0, Float(round(Double(model.bgmVolume - 0.01) * 100) / 100))
+                    } label: {
+                        Image(systemName: "minus.circle")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.plain)
+
+                    Text(String(format: "%d%%", Int(round(model.bgmVolume * 100))))
+                        .font(.caption.monospacedDigit().bold())
+                        .frame(minWidth: 32, alignment: .trailing)
+
+                    Button {
+                        model.bgmVolume = min(1.0, Float(round(Double(model.bgmVolume + 0.01) * 100) / 100))
+                    } label: {
+                        Image(systemName: "plus.circle")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.plain)
+                }
+                Slider(value: $model.bgmVolume, in: 0.0...0.50, step: 0.01)
+
+                // 常用微弱/背景音量档位快捷切换
+                HStack(spacing: 5) {
+                    ForEach([("1% 极微", Float(0.01)), ("3% 隐约", Float(0.03)), ("5% 轻柔", Float(0.05)), ("10% 背景", Float(0.10)), ("20% 明显", Float(0.20))], id: \.0) { label, vol in
+                        Button {
+                            model.bgmVolume = vol
+                        } label: {
+                            Text(label)
+                                .font(.system(size: 10))
+                                .padding(.horizontal, 3)
+                                .padding(.vertical, 2)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(abs(model.bgmVolume - vol) < 0.005 ? Color.accentColor : Color.secondary)
+                    }
+                }
+
+                Toggle("智能侧链避让压限（朗读时自动降音）", isOn: $model.enableDucking)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                if model.enableDucking {
+                    Text("朗读时音量 \(String(format: "%.1f", Double(model.bgmVolume * 55)))% · 停顿空白时 \(Int(round(model.bgmVolume * 100)))%")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func pickBGM() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio, .wav, .mpeg4Audio, .mp3]
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            model.bgmURL = url
+            model.log("已选择背景音乐: \(url.lastPathComponent)")
+        }
+    }
+
     private var modePicker: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("导出模式").font(.caption).foregroundStyle(.secondary)
             Picker("模式", selection: $model.exportMode) {
-                ForEach(AppModel.ExportMode.allCases) { mode in
+                // 字幕输入已自带 SRT，SRT 模式无意义 → 仅书输入显示
+                let modes: [AppModel.ExportMode] = {
+                    if case .book = model.inputKind { return AppModel.ExportMode.allCases }
+                    return [.audio, .video]
+                }()
+                ForEach(modes) { mode in
                     Text(mode.rawValue).tag(mode)
                 }
             }
             .pickerStyle(.segmented)
-        }
-    }
-
-    private var actionButtons: some View {
-        HStack {
-            if model.isProcessing {
-                Button(role: .destructive) { model.cancelExport() } label: {
-                    Label("取消", systemImage: "stop.circle")
-                }
-            } else {
-                Button {
-                    model.startExport()
-                } label: {
-                    Label("开始生成", systemImage: "play.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(model.inputKind == nil)
-            }
-            Spacer()
         }
     }
 
@@ -1462,7 +2240,9 @@ struct PlayerView: NSViewRepresentable {
         let view = AVPlayerView()
         view.controlsStyle = .inline
         view.videoGravity = .resizeAspect
-        view.player = AVPlayer(url: url)
+        let player = AVPlayer(url: url)
+        view.player = player
+        player.play()   // 首次出现（导出完成后预览URL从 nil 变为视频）即自动播放
         return view
     }
 
@@ -1470,7 +2250,9 @@ struct PlayerView: NSViewRepresentable {
         // 按 URL 比较（AVURLAsset 的 == 语义不可靠）；避免每次 SwiftUI 更新都重建播放器。
         let currentURL = (nsView.player?.currentItem?.asset as? AVURLAsset)?.url
         if currentURL != url {
-            nsView.player = AVPlayer(url: url)
+            let newPlayer = AVPlayer(url: url)
+            nsView.player = newPlayer
+            newPlayer.play()   // 导出完成后预览：加载新视频即自动播放
         }
     }
 }

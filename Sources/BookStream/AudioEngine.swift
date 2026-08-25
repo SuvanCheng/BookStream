@@ -1,5 +1,7 @@
 import Foundation
 @preconcurrency import AVFoundation
+import AudioToolbox
+import Accelerate
 import os
 
 /// 字幕旁白溢出（语音长于字幕窗口）的处理策略。
@@ -96,10 +98,11 @@ public final class AudioEngine: @unchecked Sendable {
             do { box.result = try work() } catch { box.error = error }
             semaphore.signal()
         }
-        // 有界等待：音频线程内部已有 10 分钟看门狗，此处 12 分钟兜底，
-        // 避免任何意外情况下调用方无限阻塞。
-        if semaphore.wait(timeout: .now() + 720) == .timedOut {
-            throw BookStreamError.audioRenderFailed("音频线程任务超时（12 分钟）")
+        // 有界等待：音频线程内部已有 10 分钟看门狗，此处 90 分钟兜底，
+        // 避免任何意外情况下调用方无限阻塞。长书（数万句）AI 批量合成整体耗时可能很长，
+        // 但逐句内部有 10 分钟看门狗，不会真正挂死。
+        if semaphore.wait(timeout: .now() + 5400) == .timedOut {
+            throw BookStreamError.audioRenderFailed("音频线程任务超时（90 分钟）")
         }
         if let error = box.error { throw error }
         guard let result = box.result else {
@@ -202,40 +205,52 @@ public final class AudioEngine: @unchecked Sendable {
         var frameCursor: Int64 = 0
         let silenceChunk = AVAudioFrameCount(AudioFormat.sampleRateInt)
 
-        for (i, sentence) in sentences.enumerated() {
+        // 逐句渲染，但按窗口分批：AI 音色用「一次 Python 进程合成 128 句」大幅降低逐句起进程的
+        // 开销（整本书可省约 5×），同时边合成边写入 WAV，内存只占一个窗口。
+        let allTexts = sentences.map(\.text)
+        var s = 0
+        let batchSize = 128
+        while s < sentences.count {
             if cancellation() { throw BookStreamError.cancelled }
-
-            let startPos = file.framePosition
-            let rawBuffers = try renderOne(
-                sentence: sentence.text,
-                voice: voice,
-                rate: rate,
-                synthesizer: synth,
-                piper: piper,
-                piperVoice: piperVoice
-            )
-            let converted = try convertAll(rawBuffers, to: pcmMono44k)
-            for buf in converted {
-                try file.write(from: buf)
+            let end = min(s + batchSize, sentences.count)
+            let windowTexts = Array(allTexts[s..<end])
+            let perSentence: [[AVAudioPCMBuffer]]
+            if let piper, let piperVoice {
+                perSentence = try piper.renderBatch(texts: windowTexts, voice: piperVoice, rate: rate)
+            } else {
+                perSentence = try windowTexts.map { t in
+                    try renderOne(sentence: t, voice: voice, rate: rate, synthesizer: synth, piper: nil, piperVoice: nil)
+                }
             }
-            let frames = file.framePosition - startPos
+            for j in 0..<perSentence.count {
+                if cancellation() { throw BookStreamError.cancelled }
+                let i = s + j
+                let sentence = sentences[i]
+                let converted = try convertAll(perSentence[j], to: pcmMono44k)
+                for buf in converted {
+                    try file.write(from: buf)
+                }
+                let voiceFrames = converted.reduce(0) { $0 + Int64($1.frameLength) }
 
-            // 句后停顿（真人朗读节奏）：计入本片段时长，字幕随停顿停留
-            var pauseFrames: Int64 = 0
-            if pauseScale > 0, sentence.pauseAfter > 0 {
-                pauseFrames = Int64((sentence.pauseAfter * Double(pauseScale) * AudioFormat.sampleRate).rounded())
-                try writeSilence(file, frames: pauseFrames, chunk: silenceChunk)
+                // 句后停顿（真人朗读节奏）：计入本片段时长，字幕随停顿停留
+                var pauseFrames: Int64 = 0
+                if pauseScale > 0, sentence.pauseAfter > 0 {
+                    pauseFrames = Int64((sentence.pauseAfter * Double(pauseScale) * AudioFormat.sampleRate).rounded())
+                    try writeSilence(file, frames: pauseFrames, chunk: silenceChunk)
+                }
+
+                segments.append(TimedSegment(
+                    id: i,
+                    text: sentence.text,
+                    startFrame: frameCursor,
+                    endFrame: frameCursor + voiceFrames + pauseFrames,
+                    speechEndFrame: frameCursor + voiceFrames
+                ))
+                frameCursor += voiceFrames + pauseFrames
+
+                reportProgress(progress, done: i + 1, total: sentences.count)
             }
-
-            segments.append(TimedSegment(
-                id: i,
-                text: sentence.text,
-                startFrame: frameCursor,
-                endFrame: frameCursor + frames + pauseFrames
-            ))
-            frameCursor += frames + pauseFrames
-
-            reportProgress(progress, done: i + 1, total: sentences.count)
+            s = end
         }
         return SynthResult(wavURL: outputURL, segments: segments)
     }
@@ -284,6 +299,7 @@ public final class AudioEngine: @unchecked Sendable {
                 piperVoice: piperVoice
             )
             let converted = try convertAll(rawBuffers, to: pcmMono44k)
+            let voiceFrames = converted.reduce(0) { $0 + Int64($1.frameLength) }
 
             switch overflowPolicy {
             case .extend:
@@ -300,7 +316,13 @@ public final class AudioEngine: @unchecked Sendable {
                 if captionEnd > entryEnd {
                     warnings.append("第 \(i + 1) 条旁白超出窗口 \(String(format: "%.2f", Double(captionEnd - entryEnd) / AudioFormat.sampleRate))s，已顺延（语音与字幕保持同步）")
                 }
-                segments.append(TimedSegment(id: i, text: entry.text, startFrame: startFrame, endFrame: captionEnd))
+                segments.append(TimedSegment(
+                    id: i,
+                    text: entry.text,
+                    startFrame: startFrame,
+                    endFrame: captionEnd,
+                    speechEndFrame: startFrame + voiceFrames
+                ))
                 prevCaptionEnd = captionEnd
 
             case .truncate:
@@ -340,7 +362,13 @@ public final class AudioEngine: @unchecked Sendable {
                     try writeSilence(file, frames: captionEnd - cursor, chunk: silenceChunk)
                     cursor = captionEnd
                 }
-                segments.append(TimedSegment(id: i, text: entry.text, startFrame: startFrame, endFrame: captionEnd))
+                segments.append(TimedSegment(
+                    id: i,
+                    text: entry.text,
+                    startFrame: startFrame,
+                    endFrame: captionEnd,
+                    speechEndFrame: startFrame + min(voiceFrames, captionEnd - startFrame)
+                ))
                 prevCaptionEnd = captionEnd
             }
 
@@ -360,6 +388,13 @@ public final class AudioEngine: @unchecked Sendable {
         piper: PiperTTS?,
         piperVoice: PiperVoice?
     ) throws -> [AVAudioPCMBuffer] {
+        // 无「可发音」内容的句子（空串 / 纯空白 / 纯标点，如装饰分隔线 "------"、单句号 "."）
+        // 直接返回空：Piper 对这类输入会退出码 1（wave.Error: # channels not specified），
+        // 整本书渲染会因此中断。跳过它，下游按 0 时长处理即可。
+        let trimmed = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.contains(where: { $0.isLetter || $0.isNumber }) {
+            return []
+        }
         // ---- AI 音色（本地 Piper）----
         if let piper, let piperVoice {
             return try piper.render(text: sentence, voice: piperVoice, rate: rate)
@@ -477,6 +512,303 @@ public final class AudioEngine: @unchecked Sendable {
                 progress(done, total)
             }
         }
+    }
+
+    /// 将 16-bit PCM WAV 音频快速转换为高品质 AAC 压缩的 M4B/M4A 有声书格式（AudioToolbox 硬件加速编码）。
+    public static func convertWavToM4b(wavURL: URL, outputURL: URL) throws {
+        try? FileManager.default.removeItem(at: outputURL)
+
+        var outAsbd = AudioStreamBasicDescription(
+            mSampleRate: 44100,
+            mFormatID: kAudioFormatMPEG4AAC,
+            mFormatFlags: 0,
+            mBytesPerPacket: 0,
+            mFramesPerPacket: 1024,
+            mBytesPerFrame: 0,
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 0,
+            mReserved: 0
+        )
+
+        var outFile: ExtAudioFileRef?
+        let createStatus = ExtAudioFileCreateWithURL(
+            outputURL as CFURL,
+            kAudioFileM4AType,
+            &outAsbd,
+            nil,
+            AudioFileFlags.eraseFile.rawValue,
+            &outFile
+        )
+        guard createStatus == noErr, let outFile else {
+            throw BookStreamError.audioRenderFailed("创建 M4B 输出文件失败: \(createStatus)")
+        }
+        defer { ExtAudioFileDispose(outFile) }
+
+        var inExtFile: ExtAudioFileRef?
+        let openStatus = ExtAudioFileOpenURL(wavURL as CFURL, &inExtFile)
+        guard openStatus == noErr, let inExtFile else {
+            throw BookStreamError.audioRenderFailed("打开 WAV 音频失败: \(openStatus)")
+        }
+        defer { ExtAudioFileDispose(inExtFile) }
+
+        var clientFormat = AudioStreamBasicDescription(
+            mSampleRate: 44100,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        ExtAudioFileSetProperty(inExtFile, kExtAudioFileProperty_ClientDataFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &clientFormat)
+        ExtAudioFileSetProperty(outFile, kExtAudioFileProperty_ClientDataFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &clientFormat)
+
+        let chunkSize: UInt32 = 8192
+        var floatBuf = [Float](repeating: 0, count: Int(chunkSize))
+
+        try floatBuf.withUnsafeMutableBytes { rawPtr in
+            var transferBuf = AudioBufferList(
+                mNumberBuffers: 1,
+                mBuffers: AudioBuffer(mNumberChannels: 1, mDataByteSize: chunkSize * 4, mData: rawPtr.baseAddress)
+            )
+
+            while true {
+                var readFrames = chunkSize
+                let rStatus = ExtAudioFileRead(inExtFile, &readFrames, &transferBuf)
+                if rStatus != noErr || readFrames == 0 { break }
+                let wStatus = ExtAudioFileWrite(outFile, readFrames, &transferBuf)
+                if wStatus != noErr { throw BookStreamError.audioRenderFailed("写入 M4B 数据失败: \(wStatus)") }
+            }
+        }
+    }
+
+    /// 将背景音乐（BGM）与语音音轨进行高质量混音，支持智能侧链避让压限（Audio Ducking）。
+    public static func mixBGM(
+        voiceWAVURL: URL,
+        bgmURL: URL,
+        outputURL: URL,
+        bgmVolume: Float = 0.20,
+        enableDucking: Bool = true
+    ) throws {
+        let voiceFile = try AVAudioFile(forReading: voiceWAVURL)
+        let voiceFormat = voiceFile.processingFormat
+        let totalVoiceFrames = AVAudioFrameCount(voiceFile.length)
+        guard totalVoiceFrames > 0 else { return }
+
+        guard let voiceBuffer = AVAudioPCMBuffer(pcmFormat: voiceFormat, frameCapacity: totalVoiceFrames) else {
+            throw BookStreamError.audioRenderFailed("无法分配语音混音缓冲")
+        }
+        try voiceFile.read(into: voiceBuffer)
+
+        let bgmFile = try AVAudioFile(forReading: bgmURL)
+        let bgmFormat = bgmFile.processingFormat
+        let bgmTotalFrames = AVAudioFrameCount(bgmFile.length)
+        guard bgmTotalFrames > 0 else { return }
+
+        guard let rawBgmBuffer = AVAudioPCMBuffer(pcmFormat: bgmFormat, frameCapacity: bgmTotalFrames) else {
+            throw BookStreamError.audioRenderFailed("无法分配 BGM 读取缓冲")
+        }
+        try bgmFile.read(into: rawBgmBuffer)
+
+        var finalBgmBuffer = rawBgmBuffer
+        if bgmFormat != voiceFormat {
+            let ratio = voiceFormat.sampleRate / bgmFormat.sampleRate
+            let targetCapacity = AVAudioFrameCount(ceil(Double(bgmTotalFrames) * ratio)) + 1024
+            guard let convertedBuf = AVAudioPCMBuffer(pcmFormat: voiceFormat, frameCapacity: targetCapacity),
+                  let converter = AVAudioConverter(from: bgmFormat, to: voiceFormat) else {
+                throw BookStreamError.audioRenderFailed("无法初始化 BGM 格式转换器")
+            }
+            var error: NSError?
+            let fedBox = WorkBox<Bool>()
+            fedBox.result = false
+            converter.convert(to: convertedBuf, error: &error) { _, outStatus in
+                if fedBox.result != true {
+                    fedBox.result = true
+                    outStatus.pointee = .haveData
+                    return rawBgmBuffer
+                } else {
+                    outStatus.pointee = .noDataNow
+                    return nil
+                }
+            }
+            if let error { throw error }
+            finalBgmBuffer = convertedBuf
+        }
+
+        let bgmFrames = Int(finalBgmBuffer.frameLength)
+        guard bgmFrames > 0 else { return }
+
+        let duckedVolume: Float = enableDucking ? bgmVolume * 0.55 : bgmVolume
+        var currentGain: Float = bgmVolume
+
+        let chunkSize = 512
+        let numChunks = Int(totalVoiceFrames) / chunkSize
+
+        let voicePtr = voiceBuffer.floatChannelData![0]
+        let bgmPtr = finalBgmBuffer.floatChannelData![0]
+
+        for c in 0..<numChunks {
+            let offset = c * chunkSize
+            var voiceRms: Float = 0
+            vDSP_rmsqv(voicePtr + offset, 1, &voiceRms, vDSP_Length(chunkSize))
+
+            let isSpeaking = voiceRms > 0.035
+            let targetGain = isSpeaking ? duckedVolume : bgmVolume
+            let smoothing: Float = isSpeaking ? 0.08 : 0.03
+
+            for s in 0..<chunkSize {
+                currentGain = currentGain * (1.0 - smoothing) + targetGain * smoothing
+                let bgmIndex = (offset + s) % bgmFrames
+                let v = voicePtr[offset + s]
+                let b = bgmPtr[bgmIndex] * currentGain
+                voicePtr[offset + s] = max(-1.0, min(1.0, v + b))
+            }
+        }
+
+        // 末尾不足一个 chunk 的部分
+        let remOffset = numChunks * chunkSize
+        let remFrames = Int(totalVoiceFrames) - remOffset
+        if remFrames > 0 {
+            for s in 0..<remFrames {
+                let bgmIndex = (remOffset + s) % bgmFrames
+                let v = voicePtr[remOffset + s]
+                let b = bgmPtr[bgmIndex] * currentGain
+                voicePtr[remOffset + s] = max(-1.0, min(1.0, v + b))
+            }
+        }
+
+        let tempURL = outputURL.deletingLastPathComponent().appendingPathComponent("temp_mix_\(UUID().uuidString).wav")
+        let outFile = try AVAudioFile(forWriting: tempURL, settings: voiceFile.fileFormat.settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+        try outFile.write(from: voiceBuffer)
+
+        try? FileManager.default.removeItem(at: outputURL)
+        try FileManager.default.moveItem(at: tempURL, to: outputURL)
+    }
+
+    /// 生成内置高品质环境白噪音与和弦背景音乐（无需外部文件即可一键使用）。
+    public static func generateProceduralBGM(preset: String, totalSeconds: Double, outputURL: URL) throws {
+        let sampleRate = 44100.0
+        let totalFrames = Int(sampleRate * max(1.0, totalSeconds))
+        let pcmMono44k = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
+
+        guard let buf = AVAudioPCMBuffer(pcmFormat: pcmMono44k, frameCapacity: AVAudioFrameCount(totalFrames)) else {
+            throw BookStreamError.audioRenderFailed("无法分配环境音乐生成缓冲")
+        }
+        buf.frameLength = AVAudioFrameCount(totalFrames)
+        guard let ptr = buf.floatChannelData?[0] else {
+            throw BookStreamError.audioRenderFailed("无法获取音频数据指针")
+        }
+
+        switch preset {
+        case "rain":
+            // 沉浸雨声（粉红噪声滤波 + 细雨点滴）
+            var b0: Float = 0, b1: Float = 0, b2: Float = 0
+            for i in 0..<totalFrames {
+                let white = Float.random(in: -1.0...1.0)
+                b0 = 0.99765 * b0 + white * 0.0990460
+                b1 = 0.96300 * b1 + white * 0.2965164
+                b2 = 0.57000 * b2 + white * 1.0526913
+                let pink = (b0 + b1 + b2 + white * 0.1848) * 0.25
+                ptr[i] = pink
+            }
+
+        case "ocean":
+            // 海浪波涛（低频暗噪调制慢周期潮汐起伏，周期 ~7s，平缓真实）
+            var last: Float = 0
+            for i in 0..<totalFrames {
+                let t = Double(i) / sampleRate
+                let white = Float.random(in: -1.0...1.0)
+                last = (last + (0.022 * white)) / 1.022
+                let swell = 0.35 + 0.65 * pow(sin(Float(t * 2.0 * .pi / 7.0 - .pi / 2)) * 0.5 + 0.5, 1.8)
+                ptr[i] = last * 2.2 * swell * 0.60
+            }
+
+        case "stream":
+            // 山间小溪（高频细腻气泡微流动）
+            var b0: Float = 0, b1: Float = 0
+            var bubblePhase: Float = 0
+            for i in 0..<totalFrames {
+                let t = Double(i) / sampleRate
+                let white = Float.random(in: -1.0...1.0)
+                b0 = 0.95 * b0 + white * 0.05
+                b1 = 0.85 * b1 + (white - b0) * 0.15
+                bubblePhase += 0.02 * (1.0 + 0.5 * sin(Float(t * 7.3)))
+                let ripple = 0.7 + 0.3 * sin(bubblePhase)
+                ptr[i] = (white * 0.20 + b1 * 0.80) * ripple * 0.38
+            }
+
+        case "forest":
+            // 林间微风（温润带通滤波 + 阵风呼吸感）
+            var wind: Float = 0
+            for i in 0..<totalFrames {
+                let t = Double(i) / sampleRate
+                let white = Float.random(in: -1.0...1.0)
+                wind = 0.995 * wind + white * 0.005
+                let gust = 0.45 + 0.55 * (0.5 + 0.5 * sin(Float(t * 2.0 * .pi / 8.5)))
+                ptr[i] = wind * 4.5 * gust * 0.50
+            }
+
+        case "darkNoise":
+            // 暗噪音（1/f² 深沉静谧布朗噪声，专注入眠）
+            var brown: Float = 0
+            for i in 0..<totalFrames {
+                let white = Float.random(in: -1.0...1.0)
+                brown = (brown + (0.020 * white)) / 1.020
+                ptr[i] = brown * 2.0 * 0.60
+            }
+
+        case "pinkNoise":
+            // 平衡粉噪（1/f 自然粉红噪声）
+            var b0: Float = 0, b1: Float = 0, b2: Float = 0
+            for i in 0..<totalFrames {
+                let white = Float.random(in: -1.0...1.0)
+                b0 = 0.99886 * b0 + white * 0.0555179
+                b1 = 0.99332 * b1 + white * 0.0750759
+                b2 = 0.96900 * b2 + white * 0.1538520
+                let pink = (b0 + b1 + b2 + white * 0.5362) * 0.16
+                ptr[i] = pink * 0.60
+            }
+
+        default:
+            // 舒缓和弦氛围乐（Cmaj7 -> Am7 -> Fmaj7 -> Gsus4 循环流动，标准饱满泛音）
+            let chords: [[Float]] = [
+                [261.63, 329.63, 392.00, 493.88], // Cmaj7
+                [220.00, 261.63, 329.63, 392.00], // Am7
+                [174.61, 220.00, 261.63, 349.23], // Fmaj7
+                [196.00, 261.63, 293.66, 392.00]  // Gsus4
+            ]
+            let chordDuration = 4.0
+            for i in 0..<totalFrames {
+                let t = Double(i) / sampleRate
+                let chordIdx = Int(t / chordDuration) % chords.count
+                let chord = chords[chordIdx]
+                let chordTime = t.truncatingRemainder(dividingBy: chordDuration)
+                let env = min(1.0, chordTime / 0.25) * max(0.4, 1.0 - chordTime / chordDuration * 0.45)
+
+                var sample: Float = 0
+                for (idx, freq) in chord.enumerated() {
+                    let weight: Float = (idx == 0) ? 0.38 : 0.22
+                    let osc = sin(Float(t * Double(freq) * 2.0 * .pi))
+                    let overtone = sin(Float(t * Double(freq * 2.0) * 2.0 * .pi)) * 0.20
+                    sample += (osc + overtone) * weight
+                }
+                ptr[i] = sample * Float(env) * 0.55
+            }
+        }
+
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ]
+        let outFile = try AVAudioFile(forWriting: outputURL, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+        try outFile.write(from: buf)
     }
 }
 

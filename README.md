@@ -2,39 +2,51 @@
 
 macOS 原生离线有声书 / 字幕视频生成器（纯终端一键构建，Swift 6 严格并发）。
 
-## 功能
+## 快捷键指南
 
-- 输入：`.txt` / `.epub`（电子书）、`.srt` / `.ass` / `.ssa`（字幕）
-- **模式一 · 离线音频 + SRT + ASS**：`AVSpeechSynthesizer.write` 离线抓轨，按实际产出
-  PCM 帧数（44.1 kHz）精确推导毫秒级时间戳，输出无损 WAV + 合规 UTF-8 SRT + 带高亮色
-  样式的 ASS（供外部播放器/工具使用）
-- **模式二 · 动态字幕视频（默认）**：**当前句锚定画面中心**（醒目高亮 + 大字号，无底色），
-  历史字幕以恒定速度向上滚动淡化淡出、未来字幕以同速接近渐显——恒定速度保证观感
-  稳定丝滑；所有行按「行高均值 + 间隙」间距约束，任意两行绝不重叠；高亮色带 9 色调色盘
-  + **分辨率 480p/720p/1080p/4K 可选**；**水印**（文本/图片，9 宫格位置、字号/大小、
-  透明度、颜色可调，随分辨率等比缩放）；AVAssetWriter H.264 硬件编码 @ 30fps MP4，
-  内嵌 AVPlayer 回放预览
-- **两条导出链路完全解耦**：视频模式自包含（内部自动生成音频轨，不涉及 SRT）；
-  加载字幕文件后还可**附带已有音频（wav/m4a/mp3）直接渲染视频，完全跳过 TTS**——
-  模式一的产物可直接被模式二复用，互不依赖
-- **声音**：质量优先排序（Premium/增强/默认），排除系统特效音色，按内容语言
-  （中/日/韩/俄/阿/希伯来/泰/印地/希腊/德/西/法/北欧…）自动选择最优自然音色
-  （如 Samantha / Tingting），支持「试听」；**停顿感**滑块调节句间/段间停顿倍率
-  （段末自动 1.0s、句间 0.4s 停顿），AI 音色支持合成试听
-- **本地 AI 音色（Piper 神经网络 TTS）**：完全本地离线的 AI 语音——应用内一键
-  「安装引擎」（`pip3 install piper-tts`，一次性联网）+「下载音色」（中/英文各一，
-  一次性），此后合成全程离线；引擎按 应用支持目录原生二进制 / PATH / `python3 -m piper`
-  依次探测，音色模型放于 `~/Library/Application Support/BookStream/piper/models/`
-- 下载模型地址：https://huggingface.co/rhasspy/piper-voices/tree/main
-- 100% 本地离线：合成管线无任何云端 API（仅引擎/模型一次性安装需联网）
-- 自带应用图标（`Resources/AppIcon.icns`，`Scripts/make_icon.swift` 可重新生成）
+BookStream 全面支持 macOS 原生快捷键与全局菜单，助你高效批量生产：
+
+| 快捷键 | 功能名称 | 详细说明 |
+| :--- | :--- | :--- |
+| **`⌘ + I`** (`Cmd + I`) | **导入文件** | 快速调出文件选择面板，导入 `.txt` / `.epub` / `.srt` / `.ass` |
+| **`⌘ + E`** (`Cmd + E`) | **开始生成导出** | 一键启动当前模式的批量合成（音频 / M4B / 字幕视频） |
+| **`⌘ + .`** (`Cmd + .`) | **取消生成** | 正在导出时立刻中止合成流水线并自动清理临时缓存 |
+| **`⌘ + R`** (`Cmd + R`) | **重新解析当前文件** | 调整智能修标点/拆长句开关后，快速重新解析当前书籍 |
+| **`⇧ + ⌘ + C`** (`Shift + Cmd + C`) | **复制全部运行日志** | 一键将完整的毫秒级性能与分句日志拷贝至剪贴板 |
+| **`⌘ + K`** (`Cmd + K`) | **清空运行日志** | 清理当前日志控制台面板 |
+
+---
+
+## 核心功能
+
+- **丰富输入格式**：`.txt` / `.epub`（电子书）、`.srt` / `.ass` / `.ssa`（字幕）
+- **四种导出模式**：
+  - **字幕视频（默认）**：多核并发流水线，当前句锚定画面中心，历史字幕平滑向上淡出，未来字幕逐行渐显；
+  - **M4B 有声书**：AudioToolbox 硬件 AAC 高速压缩，体积缩减 96%，自动嵌入精准章节时间戳；
+  - **无损音频**：`AVSpeechSynthesizer` 离线抓轨，44.1 kHz PCM 毫秒级时间戳，连带写出 `.srt` 与 `.ass`；
+  - **SRT 字幕草稿**：瞬时生成带字数与语速时间轴的字幕草稿。
+- **视觉美学与视频动效**：
+  - **字级卡拉OK点亮动效**：CoreText 逐行字符加权排版，高亮发光色随朗读节奏逐字逐行平滑点亮（彻底告别多行同时亮起）；
+  - **多画幅自适应**：**9:16 竖屏（默认）**、**16:9 横屏**、1:1 正方形、3:4、4:3，分辨率支持 480p / 720p / 1080p / 4K；
+  - **编解码与帧率**：**HEVC / H.265（默认硬件加速）** 与 H.264，帧率支持 24fps（电影质感）/ 25 / 30 / 60fps；
+  - **排版字体与主题**：支持宋体、楷体、苹方、系统默认等中文典雅字体；支持极简纯黑、深空微光、炭黑雅致、午夜暗韵等主题背景；
+  - **声波可视化组件**：基于真实语音 RMS 能量驱动的平滑跳动声波律动柱；
+  - **自定义水印**：支持文本/图片 9 宫格定位、透明度与等比缩放。
+- **音频处理与混音（DSP）**：
+  - **大自然音效与背景音乐（BGM）混音**：支持自选 MP3/WAV/M4A，或开箱即用的 **7 大内置自然音效与轻音乐**（海浪波涛、山间小溪、沉浸雨声、林间微风、暗噪音、平衡粉噪、舒缓和弦氛围乐）；
+  - **智能侧链避让压限（Smart Audio Ducking）**：Accelerate (vDSP) 实时识别人声能量包络，朗读时 BGM 自动压低避让，句间停顿与章节过渡自然回升；
+  - **自适应停顿呼吸感**：支持 0× ~ 2× 停顿倍率（默认 1.4×），段末与分句呼吸感自然流畅。
+- **本地 AI 音色（Piper 神经网络 TTS）**：完全本地离线的神经网络音色，一键安装引擎与模型，100% 离线运行。
+- **两条链路完全解耦**：字幕输入可**附带已有音频（wav/m4a/mp3）直接渲染视频，完全跳过 TTS**。
+
+---
 
 ## 构建与运行
 
 ```bash
 ./build.sh              # 编译 → 打包 .app → 签名 → 启动
 ./build.sh --no-launch  # 仅打包不启动
-swift run BookStream --selftest        # 无头端到端自检（TTS→WAV→SRT→MP4）
+swift run BookStream --selftest        # 无头端到端 18 项全链路自检
 swift run BookStream --parse <file>    # 解析校验（txt/epub/srt/ass/ssa）
 ```
 
@@ -45,28 +57,28 @@ swift run BookStream --parse <file>    # 解析校验（txt/epub/srt/ass/ssa）
 ```
 Package.swift                     SPM 清单（macOS 13+，Swift 6 语言模式）
 Sources/BookStream/
-  Models.swift                    数据模型 + TXT/EPUB/SRT/ASS 解析 + 分句 + SRT 写出
-  AudioEngine.swift               TTS 离线抓轨 + AVAudioConverter 重采样 + WAV 拼接
-  VideoSynthesizer.swift          滚动字幕排版（可调高亮色）+ AVAssetReader/Writer 双轨混流
-  ContentView.swift               SwiftUI 界面（拖拽/声音质量排序/语速/模式/调色盘/日志/预览）
-  BookStreamApp.swift             @main 入口（含 --selftest / --parse 无头模式）
-  SelfTest.swift                  无头端到端自检
+  Models.swift                    数据模型 + TXT/EPUB/SRT/ASS 解析 + 智能标点修复 + 分句
+  AudioEngine.swift               TTS 离线抓轨 + BGM 侧链压限混音 + M4B 硬件 AAC 压缩
+  VideoSynthesizer.swift          逐行卡拉OK排版 + 多画幅/HEVC/字体/主题/声波 + AVAssetWriter 双轨混流
+  ContentView.swift               SwiftUI 原生界面（快捷键/调色盘/音量滑块/日志/回放预览）
+  BookStreamApp.swift             @main 入口（全局快捷键与原生菜单栏绑定）
+  SelfTest.swift                  无头端到端 18 项自动化全链路自检
 Scripts/make_icon.swift           应用图标生成器（CoreGraphics 绘制 → icns）
 Resources/AppIcon.icns            应用图标
 build.sh                          一键构建打包签名启动
-docs/ARCHITECTURE.md              架构与时钟对齐方案（Turn 1 文档）
+docs/ARCHITECTURE.md              架构与时钟对齐方案
 books/odyssey.txt                 示例书籍
 ```
 
 ## 关于更自然的人声
 
 本机系统默认只带「默认」质量音色（英文最优为 Samantha，中文为 Tingting）。
-想要更接近真人声线，请在 **系统设置 → 语音 → 系统声音** 下载 Apple 的
+想要更接近真人声线，请在 **系统设置 → 辅助功能/语音 → 系统声音** 下载 Apple 的
 Enhanced / Premium（Siri）音色；下载后应用会自动把它们排在列表最前并标为
 「增强 / Premium」，默认选中最优音色。
 
 ## 快速体验
 
 1. `./build.sh --no-launch`
-2. 打开 `dist/BookStream.app`，把 `books/odyssey.txt` 拖入左侧面板
-3. 选择声音与语速，选择导出模式，点击「开始生成」
+2. 打开 `dist/BookStream.app`，按 **`⌘ + I`** 选择书籍或把 `books/odyssey.txt` 拖入左侧面板
+3. 选择声音与语速，选择背景音乐，按 **`⌘ + E`** 一键开始生成！

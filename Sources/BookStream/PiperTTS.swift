@@ -216,6 +216,14 @@ public final class PiperTTS: @unchecked Sendable {
         .sorted { ($0.language, $0.displayName) < ($1.language, $1.displayName) }
     }
 
+    /// 删除已下载的音色模型（.onnx 与配套 .onnx.json）。音色即从本地移除。
+    public static func deleteModel(_ voice: PiperVoice) {
+        try? FileManager.default.removeItem(at: voice.modelURL)
+        if let configURL = voice.configURL {
+            try? FileManager.default.removeItem(at: configURL)
+        }
+    }
+
     /// 一次性下载音色模型（rhasspy/piper-voices）。此后完全离线。
     /// 若指定 quality 无效（该档位不存在/下载失败），会**自动回退**到 low 档，
     /// 保证按钮点击总能拿到可用音色。
@@ -372,6 +380,9 @@ public final class PiperTTS: @unchecked Sendable {
             "-i", inputURL.path,
             "-f", outputURL.path,
             "--length-scale", lengthScale,
+            // 压掉句尾默认静音（Piper 每句末尾会自动加一小段静音，
+            // 字幕模式下大量句子会累积成可观的顺延漂移）。
+            "--sentence-silence", "0.05",
         ]
         if let config = voice.configURL {
             args += ["-c", config.path]
@@ -406,9 +417,141 @@ public final class PiperTTS: @unchecked Sendable {
         return buffers
     }
 
+    /// 批量合成一批句子：**用一个 Python 进程**加载模型一次，连续合成 `texts` 里各项，
+    /// 返回与输入一一对应的逐句 `[AVAudioPCMBuffer]`（模型原生采样率、float32 单声道）。
+    ///
+    /// 相比逐句各起一个子进程，把「进程启动 + 模型加载」的开销摊到一批上，长书渲染可省约 5×。
+    /// 时间轴仍按逐句时长精确划分（每句的缓冲时长即其真实朗读时长），与逐句路径完全一致。
+    ///
+    /// stdout 只作为二进制帧流（避免 print 污染）：每句写 `[int64 sampleRate][int64 sampleCount][sampleCount*4 字节 float32]`。
+    /// 空/纯标点句产出 sampleCount=0 的帧。
+    public func renderBatch(
+        texts: [String],
+        voice: PiperVoice,
+        rate: Float
+    ) throws -> [[AVAudioPCMBuffer]] {
+        guard texts.count <= 2048, !texts.isEmpty else {
+            throw BookStreamError.audioRenderFailed("批量合成句数非法（1...2048）")
+        }
+        guard PiperTTS.engineStatus() == .python else {
+            // 原生引擎不支持批量，退回逐句
+            return try texts.map { try render(text: $0, voice: voice, rate: rate) }
+        }
+
+        let fm = FileManager.default
+        let tmpDir = fm.temporaryDirectory
+        let inputURL = tmpDir.appendingPathComponent("piper-batch-in-\(UUID().uuidString).jsonl")
+        let outputURL = tmpDir.appendingPathComponent("piper-batch-out-\(UUID().uuidString).raw")
+        defer { try? fm.removeItem(at: inputURL); try? fm.removeItem(at: outputURL) }
+
+        // 等待：确保模型加载完成再写 stdin（脚本首部会向 stdout 写 READY 标记）
+        let lengthScale = String(format: "%.2f", Self.lengthScale(forRate: rate))
+        let script = PiperTTS.batchScript
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        proc.arguments = ["-c", script, voice.modelURL.path, voice.configURL?.path ?? "", lengthScale]
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        proc.standardInput = stdinPipe
+        proc.standardOutput = stdoutPipe
+        proc.standardError = stderrPipe
+        try proc.run()
+
+        // 写输入：一批 JSON 数组一行（脚本按行读）
+        let json = try JSONSerialization.data(withJSONObject: texts)
+        let fh = stdinPipe.fileHandleForWriting
+        try fh.write(contentsOf: json)
+        try fh.write(contentsOf: Data([0x0A]))   // 换行 = 结束一批
+        try fh.close()
+
+        // 读 stdout 帧并构建逐句缓冲
+        let out = stdoutPipe.fileHandleForReading
+        var buffers: [[AVAudioPCMBuffer]] = []
+        buffers.reserveCapacity(texts.count)
+        for _ in 0..<texts.count {
+            guard let header = try Self.readExact(from: out, count: 16), header.count == 16 else {
+                break
+            }
+            let sr = header[0..<8].withUnsafeBytes { $0.load(as: Int64.self) }
+            let count = header[8..<16].withUnsafeBytes { $0.load(as: Int64.self) }
+            let bytes = Int(count) * 4
+            guard let raw = try Self.readExact(from: out, count: bytes) else {
+                break
+            }
+            guard let format = AVAudioFormat(standardFormatWithSampleRate: Double(sr), channels: 1),
+                  let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)) else {
+                break
+            }
+            let len = min(Int(count) * 4, raw.count)
+            if len > 0, let dst = buf.floatChannelData?[0] {
+                raw.prefix(len).withUnsafeBytes { src in
+                    let ptr = src.baseAddress!.assumingMemoryBound(to: Float.self)
+                    dst.update(from: ptr, count: len / 4)
+                }
+            }
+            buf.frameLength = AVAudioFrameCount(len / 4)
+            buffers.append([buf])
+        }
+
+        proc.waitUntilExit()
+        if proc.terminationStatus != 0 || buffers.count != texts.count {
+            let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            throw BookStreamError.audioRenderFailed(
+                "AI 批量合成失败（退出码 \(proc.terminationStatus)）: \(stderr.prefix(200))"
+            )
+        }
+        return buffers
+    }
+
+    /// Python 常驻合成脚本：一次加载模型、按 stdin 逐行(JSON)持续合成，句以二进制帧写回 stdout。
+    private static let batchScript = """
+    import sys,json,struct,os
+    import numpy as np
+    import piper
+    model,config=sys.argv[1],sys.argv[2]
+    length_scale=float(sys.argv[3])
+    v=piper.PiperVoice.load(model,config or None)
+    sr=int(v.config.sample_rate)
+    os.write(2,("READY sr=%d\\n"%sr).encode())
+    out=os.fdopen(sys.stdout.fileno(),"wb")
+    def synth(t):
+        if not any(c.isalnum() for c in t.strip()):
+            return b""
+        try:
+            cfg=piper.SynthesisConfig(length_scale=length_scale)
+            data=b""
+            for ch in v.synthesize(t,cfg):
+                data+=np.asarray(ch.audio_float_array,np.float32).tobytes()
+            return data
+        except Exception as e:
+            os.write(2,("PYERR %r\\n"%e).encode()); return b""
+    for line in sys.stdin:
+        for t in json.loads(line):
+            raw=synth(t)
+            out.write(struct.pack("<qq",sr,len(raw)//4)); out.write(raw); out.flush()
+    """
+
+    /// 从 FileHandle 精确读取指定字节数（循环读取直到读满 count 字节或 EOF）。
+    private static func readExact(from handle: FileHandle, count: Int) throws -> Data? {
+        guard count > 0 else { return Data() }
+        var result = Data()
+        result.reserveCapacity(count)
+        while result.count < count {
+            guard let chunk = try handle.read(upToCount: count - result.count), !chunk.isEmpty else {
+                return result.isEmpty ? nil : result
+            }
+            result.append(chunk)
+        }
+        return result
+    }
+
     /// 把 App 的语速（AVSpeech 0.2~0.6，默认 0.5）映射为 piper 的 length-scale（>1 更慢）。
+    /// 校准：Piper 默认（length 1.0）比 AVSpeech 默认（rate 0.5）朗读明显偏慢，导致
+    /// 字幕窗口被逐条顺延、视频被拉长。把基线压到 0.82，使 0.5 档的 AI 节奏贴近系统音色；
+    /// 随语速单调：越低越慢、越高越快。
     private static func lengthScale(forRate rate: Float) -> Float {
-        let scale = 1.0 + (0.5 - rate) * 1.2
-        return min(max(scale, 0.7), 1.8)
+        let scale = 0.82 + (0.5 - rate) * 1.2
+        return min(max(scale, 0.6), 1.6)
     }
 }
