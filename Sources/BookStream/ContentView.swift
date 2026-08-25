@@ -18,43 +18,6 @@ final class AppModel: ObservableObject {
         var id: String { rawValue }
     }
 
-    /// Piper 音质档（用于下载音色模型）。注意：并非每个音色都有所有档位。
-    enum PiperQuality: String, CaseIterable, Identifiable {
-        case low = "low"
-        case medium = "medium"
-        case high = "high"
-        var id: String { rawValue }
-        var label: String { "\(rawValue.uppercased())" }
-    }
-
-    struct VoiceInfo: Identifiable, Sendable {
-        let id: String
-        let name: String
-        let language: String
-        let qualityRank: Int  // 3=Premium 2=增强 1=默认
-
-        var qualityLabel: String {
-            switch qualityRank {
-            case 3: return "Premium"
-            case 2: return "增强"
-            default: return "默认"
-            }
-        }
-    }
-
-    /// 系统自带的新颖/卡通音色（不能作为有声书，载入时直接从列表剔除）。
-    private static let noveltyVoiceNames: Set<String> = [
-        "Albert", "Bad News", "Bahh", "Bells", "Boing", "Bubbles", "Cellos",
-        "Deranged", "Eddy", "Flo", "Fred", "Good News", "Grandma", "Grandpa",
-        "Jester", "Junior", "Organ", "Ralph", "Reed", "Rocko", "Sandy", "Shelley",
-        "Superstar", "Trinoids", "Whisper", "Wobble", "Zarvox",
-    ]
-
-    /// 公认更接近人声的自然音色（自动选择时优先）。
-    private static let preferredNaturalVoices: Set<String> = [
-        "Samantha", "Victoria", "Alex", "Karen", "Daniel", "Tingting", "Meijia",
-    ]
-
     /// 高亮色调色盘
     static let paletteColors: [CaptionColor] = [
         .vividOrange, .red, .yellow, .green, .cyan, .blue, .purple, .pink, .white,
@@ -65,8 +28,6 @@ final class AppModel: ObservableObject {
     @Published var inputURL: URL?
 
     // 设置
-    @Published var voices: [VoiceInfo] = []
-    @Published var selectedVoiceID: String?
     /// 背景音乐预设（涵盖 macOS 经典大自然白噪音与和弦轻音乐）
     enum BGMPreset: String, CaseIterable, Identifiable {
         case none           = "关闭"
@@ -111,23 +72,16 @@ final class AppModel: ObservableObject {
         VideoResolution.make(aspectRatio: videoAspectRatio, quality: videoQuality)
     }
 
-    // 本地 AI 音色（Piper）
-    @Published var piperModels: [PiperVoice] = []
-    @Published var selectedPiperVoiceID: String?   // 选中 AI 音色：可指向已安装模型 id，或目录条目 id（未下载，生成时自动下载）；nil = 使用系统声音
-    @Published var piperEngineInstalled = false
-    @Published var isPiperInstalling = false
-    @Published var isModelDownloading = false
-    @Published var piperQuality: PiperQuality = .medium
-    @Published var piperCatalog: [PiperCatalogEntry] = []
-    @Published var catalogLoadFailed = false
-    // 首次刷新时是否已确立 AI 音色默认（只自动选一次，不覆盖用户后续手工选择）
-    private var piperDefaultChosen = false
+    // 全球顶级 AI 语音引擎体系（Kokoro-82M 离线神经网络 / 微软 Edge-TTS / 自定义 API）
+    @Published var selectedTTSEngine: TTSEngineType = .kokoro
+    @Published var selectedKokoroVoiceID: String = "af_heart"
+    @Published var selectedEdgeVoiceID: String = "zh-CN-YunxiNeural"
+    @Published var customAPISettings: CustomAPISettings = .default
 
     // 已有音频复用（字幕输入 + 视频模式时，可跳过 TTS）
     @Published var useExistingAudio = false
     @Published var companionAudioURL: URL?
-    @Published var smartParse = true   // 智能解析：自动修复原文标点（补漏/改错/折叠重复），可关闭
-    @Published var splitLongSentences = true   // L3：超长句（>60 字）按软边界拆短
+    @Published var splitLongSentences = true   // L3：超长句（>60 字/140词）按语法从句软边界拆短
 
     // 字幕旁白溢出策略（语音长于字幕窗口时：顺延 / 截断）
     @Published var subtitleOverflowPolicy: SubtitleOverflowPolicy = .extend
@@ -146,8 +100,8 @@ final class AppModel: ObservableObject {
     private var pipelineTask: Task<Void, Never>?
     private let cancelFlag = OSAllocatedUnfairLock(initialState: false)
     private var hasUserPickedVoice = false
-    private var previewSynthesizer: AVSpeechSynthesizer?
     private var previewAudioPlayer: AVAudioPlayer?
+    private var previewSound: NSSound?
     /// 导出计时与进度日志状态（每次导出开始与阶段切换时重置）。
     private var exportStartTime = Date()
     private var phaseStartTime = Date()
@@ -179,7 +133,7 @@ final class AppModel: ObservableObject {
     }
 
     /// 预估音频时长（秒）：中文约 4.8 字/秒、英文约 17 字/秒（基准 0.5 语速），
-    /// 语速缩放与 Piper 的 length-scale 一致：1 + (0.5 - rate) * 1.2。
+    /// 语速缩放：1 + (0.5 - rate) * 1.2。
     private static func estimateAudioDuration(chars: Int, hanRatio: Double, rate: Float) -> Double {
         guard chars > 0 else { return 0 }
         let base = hanRatio > 0.2 ? 4.8 : 17.0
@@ -188,7 +142,7 @@ final class AppModel: ObservableObject {
     }
 
     /// 预估生成耗时（秒）：TTS 合成 + 视频渲染。
-    /// 基准（实测校准）：Piper 本地引擎约 600 字/秒；视频渲染约 20× 实时（480p），
+    /// 基准（实测校准）：Kokoro/Edge 神经引擎约 600 字/秒；视频渲染约 20× 实时（480p），
     /// 随分辨率像素数反比缩放（1080p≈9×，4K≈2×）。
     private static func estimateGenerationTime(chars: Int, audioDur: Double, resolution: VideoResolution) -> Double {
         let tts = Double(chars) / 600.0
@@ -209,54 +163,23 @@ final class AppModel: ObservableObject {
 
     // MARK: - 生命周期
 
-    func loadVoices() {
-        let all = AVSpeechSynthesisVoice.speechVoices()
-        voices = all.compactMap { v -> VoiceInfo? in
-            // 剔除系统特效/新颖音色：不能作为有声书，直接从列表移除
-            guard !Self.noveltyVoiceNames.contains(v.name) else { return nil }
-            let rank: Int
-            if #available(macOS 14.0, *) {
-                rank = v.quality == .premium ? 3 : (v.quality == .enhanced ? 2 : 1)
-            } else {
-                rank = v.quality == .enhanced ? 2 : 1
-            }
-            return VoiceInfo(
-                id: v.identifier,
-                name: v.name,
-                language: v.language,
-                qualityRank: rank
-            )
-        }
-        .sorted { a, b in
-            if a.qualityRank != b.qualityRank { return a.qualityRank > b.qualityRank }
-            if a.language != b.language { return a.language < b.language }
-            return a.name < b.name
-        }
-        if selectedVoiceID == nil {
-            selectDefaultVoice(for: nil)
-        }
-        // “默认”应指向实际选中的音色（selectedVoiceID），而非排序表首
-        let selected = voices.first { $0.id == selectedVoiceID }
-        let (name, lang) = selected.flatMap { ($0.name, $0.language) } ?? ("", "")
+    func initializeApp() {
         log("环境: \(Self.environmentSummary())")
-        log("已加载 \(voices.count) 个系统声音（Premium/增强优先，默认 \(name) [\(lang)]）")
+        log("AI 引擎就绪（默认使用 Kokoro-82M 顶级离线神经模型 · af_heart）")
     }
 
-    /// 按内容语言自动选择最佳自然音色（质量优先、优先公认自然音色）。
+    /// 按内容语言自动选择最佳配音（Kokoro / Edge-TTS）。
     func selectDefaultVoice(for text: String?) {
         let language = Self.detectLanguage(of: text)
-        func matchesLanguage(_ v: VoiceInfo) -> Bool {
-            v.language == language || v.language.hasPrefix(language)
-        }
-        let best = voices.first { v in
-            Self.preferredNaturalVoices.contains(v.name) && matchesLanguage(v)
-        } ?? voices.first { v in
-            matchesLanguage(v)
-        } ?? voices.first
-        guard let best else { return }
-        if selectedVoiceID != best.id {
-            selectedVoiceID = best.id
-            log("检测内容语言为 \(Self.languageName(language))，自动选择声音: \(best.name)（可手动更换）")
+        if language == "zh-CN" {
+            selectedKokoroVoiceID = "zm_yunxi"
+            selectedEdgeVoiceID = "zh-CN-YunxiNeural"
+        } else if language == "ja-JP" {
+            selectedKokoroVoiceID = "jf_alpha"
+            selectedEdgeVoiceID = "ja-JP-NanamiNeural"
+        } else {
+            selectedKokoroVoiceID = "af_heart"
+            selectedEdgeVoiceID = "en-US-ChristopherNeural"
         }
     }
 
@@ -325,214 +248,141 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 试听所选声音（简短样例，实时合成）。
-    func previewVoice() {
-        guard let id = selectedVoiceID, let voice = AVSpeechSynthesisVoice(identifier: id) else { return }
-        let utterance = AVSpeechUtterance(string: "Hello, this is a preview of the selected voice. 你好，这是所选声音的试听。")
-        utterance.voice = voice
-        utterance.rate = 0.45
-        // 延迟创建：避免在应用启动时就初始化语音框架（与后台抓轨并存）
-        let synth = previewSynthesizer ?? {
-            let s = AVSpeechSynthesizer()
-            previewSynthesizer = s
-            return s
-        }()
-        synth.stopSpeaking(at: .immediate)
-        synth.speak(utterance)
-        log("试听声音: \(voice.name)")
-    }
-
     /// 用户手动改过声音后，不再按内容语言自动切换。
     func markVoicePickedByUser() {
         hasUserPickedVoice = true
     }
 
-    /// 试听当前选中的 AI 音色（本地合成一句样例并播放）。
-    func previewPiperVoice() {
-        guard piperEngineInstalled, let voice = selectedPiperVoice else { return }
-        let rate = speechRate
-        log("正在合成 AI 试听（\(voice.displayName) · \(voice.language)）...")
-        Task.detached(priority: .userInitiated) {
-            do {
-                let buffers = try PiperTTS().render(
-                    text: "This is a preview of the local AI voice. 你好，这是本地 AI 音色的试听。",
-                    voice: voice, rate: rate
-                )
-                let tmp = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("piper-preview-\(UUID().uuidString).wav")
-                let sr = buffers.first?.format.sampleRate ?? 16000
-                let file = try AVAudioFile(forWriting: tmp, settings: [
-                    AVFormatIDKey: kAudioFormatLinearPCM,
-                    AVSampleRateKey: sr,
-                    AVNumberOfChannelsKey: 1,
-                    AVLinearPCMBitDepthKey: 16,
-                    AVLinearPCMIsFloatKey: false,
-                    AVLinearPCMIsBigEndianKey: false,
-                    AVLinearPCMIsNonInterleaved: false,
-                ], commonFormat: .pcmFormatFloat32, interleaved: false)
-                for buf in buffers { try file.write(from: buf) }
-                DispatchQueue.main.async {
-                    MainActor.assumeIsolated {
-                        self.previewAudioPlayer = try? AVAudioPlayer(contentsOf: tmp)
-                        self.previewAudioPlayer?.play()
-                        self.log("AI 音色试听播放中（\(voice.displayName)）")
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
-                            try? FileManager.default.removeItem(at: tmp)
-                        }
-                    }
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    MainActor.assumeIsolated {
-                        self.log("AI 音色试听失败: \(error.localizedDescription)")
-                    }
-                }
-            }
+    /// 将 PCM 音频缓冲完整写入临时 WAV 文件（确保文件句柄关闭、Header 写入完整）
+    nonisolated private static func writeBuffersToTempWav(_ buffers: [AVAudioPCMBuffer]) throws -> URL {
+        guard let first = buffers.first else {
+            throw BookStreamError.audioRenderFailed("无有效音频数据")
         }
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("preview-\(UUID().uuidString).wav")
+        let sr = first.format.sampleRate
+        let file = try AVAudioFile(forWriting: tmp, settings: [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: sr,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ], commonFormat: .pcmFormatFloat32, interleaved: false)
+        for buf in buffers {
+            try file.write(from: buf)
+        }
+        return tmp
     }
 
-    // MARK: - 本地 AI 音色（Piper）
+    /// 播放试听音频（双重引擎保证：优先 AVAudioPlayer，回退 NSSound）
+    @MainActor
+    private func playPreviewAudio(at url: URL, label: String) {
+        // 先停掉上一段试听，避免多重并发播放
+        self.previewAudioPlayer?.stop()
+        self.previewSound?.stop()
 
-    /// 刷新 AI 引擎状态与已安装音色模型。
-    func refreshPiper(forceCatalog: Bool = false) {
-        PiperTTS.invalidateEngineCache()   // 安装/下载后引擎探测结果可能已变
-        piperEngineInstalled = PiperTTS.engineStatus() != .notInstalled
-        piperModels = PiperTTS.listModels()
-        // 需求：默认音色 = AI 音色里可用的第一个；只有首次刷新、且用户未手工选过时才自动确立，
-        // 之后不再覆盖用户选择（选了“使用系统声音”也保留）。
-        if !piperDefaultChosen {
-            if let first = piperModels.first, selectedPiperVoiceID == nil {
-                selectedPiperVoiceID = first.id
-                log("默认使用 AI 音色: \(first.displayName) · \(first.language)")
-            }
-            piperDefaultChosen = true
-        }
-        if let selected = selectedPiperVoiceID {
-            // 仅当该 id 既不是已安装模型、也不是目录条目时，才视为失效清空；
-            // 允许“仅选中未下载目录音色”（保留，生成时自动下载）。
-            let installed = piperModels.contains { $0.id == selected }
-            let catalogOK = piperCatalog.contains { $0.id == selected }
-            if !installed && !catalogOK {
-                selectedPiperVoiceID = nil
-            }
-        }
-        if piperEngineInstalled {
-            log("AI 引擎就绪（\(piperModels.count) 个本地音色模型）")
-        }
-        // 后台拉取可下载音色目录（联网）。仅在“尚未载入 / 上次失败 / 用户点刷新”时联网，
-        // 避免每次下载完成或常规刷新都重新抓一遍 voices.json。
-        let needCatalog = forceCatalog || piperCatalog.isEmpty || catalogLoadFailed
-        guard needCatalog else { return }
-        Task.detached(priority: .utility) {
-            do {
-                let catalog = try PiperTTS.fetchCatalog()
-                await MainActor.run {
-                    self.piperCatalog = catalog
-                    self.catalogLoadFailed = false
-                }
-            } catch {
-                await MainActor.run { self.catalogLoadFailed = true }
-            }
-        }
-    }
-
-    /// 一次性安装本地 AI 引擎（pip 安装 piper-tts，需联网；之后完全离线）。
-    /// 注意：必须在后台线程执行（pip3 安装可能耗时数分钟，不能阻塞主线程）。
-    func installPiperEngine() {
-        guard !isPiperInstalling else { return }
-        isPiperInstalling = true
-        log("正在安装本地 AI 引擎（pip3 install piper-tts，一次性）...")
-        Task.detached(priority: .userInitiated) {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/pip3")
-            proc.arguments = ["install", "--user", "piper-tts"]
-            proc.standardOutput = Pipe()
-            proc.standardError = Pipe()
-            let status: Int32
-            do {
-                try proc.run()
-                proc.waitUntilExit()
-                status = proc.terminationStatus
-            } catch {
-                status = -1
-            }
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated {
-                    self.isPiperInstalling = false
-                    if status == 0 {
-                        self.log("AI 引擎安装完成")
-                        self.refreshPiper()
-                    } else {
-                        self.log("AI 引擎安装失败（退出码 \(status)，请手动执行: pip3 install --user piper-tts）")
-                    }
-                }
-            }
-        }
-    }
-
-    /// 下载指定目录条目（按 id），并**等待到完成/失败**后返回结果。
-    /// 返回下载后的 PiperVoice；失败时抛出。用于「选中未下载音色 → 生成前自动下载」。
-    func downloadCatalogEntryAndWait(_ id: String) async throws -> PiperVoice {
-        guard !isModelDownloading else {
-            throw BookStreamError.audioRenderFailed("已有音色在下载中，请稍后再试")
-        }
-        guard let entry = piperCatalog.first(where: { $0.id == id }) else {
-            throw BookStreamError.audioRenderFailed("该音色不在可下载目录中: \(id)")
-        }
-        isModelDownloading = true
-        let quality = piperQuality.rawValue
-        log("生成前自动下载 AI 音色 \(entry.displayName)（档位 \(quality)）...")
         do {
-            let voice = try await Task.detached(priority: .userInitiated) {
-                try PiperTTS.downloadCanonical(catalogEntry: entry, quality: quality)
-            }.value
-            self.isModelDownloading = false
-            self.refreshPiper()
-            self.log("AI 音色下载完成: \(voice.displayName) · \(voice.language)（\(voice.id)）")
-            return voice
+            let player = try AVAudioPlayer(contentsOf: url)
+            player.prepareToPlay()
+            player.volume = 1.0
+            if player.play() {
+                self.previewAudioPlayer = player
+                self.log("\(label)播放中")
+            } else if let sound = NSSound(contentsOf: url, byReference: true), sound.play() {
+                self.previewSound = sound
+                self.log("\(label)播放中")
+            } else {
+                self.log("\(label)播放未启动（请检查系统音频输出设备与音量）")
+            }
         } catch {
-            self.isModelDownloading = false
-            self.log("AI 音色下载失败: \(error.localizedDescription)")
-            throw error
+            if let sound = NSSound(contentsOf: url, byReference: true), sound.play() {
+                self.previewSound = sound
+                self.log("\(label)播放中")
+            } else {
+                self.log("\(label)播放失败: \(error.localizedDescription)")
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+            try? FileManager.default.removeItem(at: url)
         }
     }
 
-    /// 删除已下载的音色模型（.onnx/.onnx.json 一并移除），并清理选中状态。
-    func deletePiperVoice(_ voice: PiperVoice) {
-        guard piperModels.contains(where: { $0.id == voice.id }) else { return }
-        PiperTTS.deleteModel(voice)
-        if selectedPiperVoiceID == voice.id { selectedPiperVoiceID = nil }
-        refreshPiper()
-        log("已删除 AI 音色: \(voice.displayName) · \(voice.language)")
-    }
-
-    /// 手动下载「选中的未下载目录音色」（不阻塞，后台跑完回调刷新列表）。
-    func startSelectedVoiceDownload() {
-        guard let id = selectedPiperVoiceID,
-              let entry = piperCatalog.first(where: { $0.id == id }),
-              selectedPiperVoice == nil else { return }
-        guard !isModelDownloading else {
-            log("已有音色在下载中，请稍后再试")
-            return
-        }
-        isModelDownloading = true
-        let quality = piperQuality.rawValue
-        log("正在下载 AI 音色 \(entry.displayName)（档位 \(quality)，约 20~60MB）...")
+    /// 试听 Kokoro-82M 本地神经音色
+    func previewKokoroVoice() {
+        let voiceId = selectedKokoroVoiceID
+        let rate = speechRate
+        log("正在连接 Kokoro-82M 本地试听（\(voiceId)）...")
         Task.detached(priority: .userInitiated) {
             do {
-                let voice = try PiperTTS.downloadCanonical(catalogEntry: entry, quality: quality)
+                let sampleText: String
+                if voiceId.hasPrefix("z") {
+                    sampleText = "欢迎收听听力巴士。这是一段 Kokoro 本地神经网络语音的试听。"
+                } else if voiceId.hasPrefix("j") {
+                    sampleText = "こんにちは。これはKokoro音声プレビューです。"
+                } else {
+                    sampleText = "Welcome to Listening Bus. This is a preview of Kokoro local neural voice."
+                }
+                let buffers = try KokoroTTS.shared.render(text: sampleText, voice: voiceId, rate: rate)
+                let tmp = try Self.writeBuffersToTempWav(buffers)
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
-                        self.isModelDownloading = false
-                        self.refreshPiper()
-                        self.log("AI 音色下载完成: \(voice.displayName) · \(voice.language)（\(voice.id)）")
+                        self.playPreviewAudio(at: tmp, label: "Kokoro 音色试听（\(voiceId)）")
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
-                        self.isModelDownloading = false
-                        self.log("AI 音色下载失败: \(error.localizedDescription)")
+                        self.log("Kokoro 试听失败: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
+
+    /// 试听微软 Neural 广播级音色
+    func previewEdgeVoice() {
+        let voiceId = selectedEdgeVoiceID
+        let rate = speechRate
+        log("正在连接微软 Neural 试听（\(voiceId)）...")
+        Task.detached(priority: .userInitiated) {
+            do {
+                let sampleText = voiceId.hasPrefix("zh") ? "欢迎收听听力巴士。这是一段微软广播级神经语音的试听。" : "Welcome to Listening Bus. This is a preview of Microsoft Neural broadcast voice."
+                let buffers = try EdgeTTS.shared.render(text: sampleText, voiceId: voiceId, rate: rate)
+                let tmp = try Self.writeBuffersToTempWav(buffers)
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self.playPreviewAudio(at: tmp, label: "微软 Neural 音色试听（\(voiceId)）")
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self.log("微软 Neural 试听失败: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
+
+    /// 试听自定义 API 音色
+    func previewCustomAPIVoice() {
+        let settings = customAPISettings
+        let rate = speechRate
+        log("正在连接自定义 API 试听（\(settings.provider.label) · \(settings.model)）...")
+        Task.detached(priority: .userInitiated) {
+            do {
+                let buffers = try CustomAPITTS.shared.render(text: "Welcome to Listening Bus. 这是自定义 API 语音接口的试听样例。", settings: settings, rate: rate)
+                let tmp = try Self.writeBuffersToTempWav(buffers)
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self.playPreviewAudio(at: tmp, label: "自定义 API 试听")
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self.log("自定义 API 试听失败: \(error.localizedDescription)")
                     }
                 }
             }
@@ -547,10 +397,9 @@ final class AppModel: ObservableObject {
             let ext = url.pathExtension.lowercased()
             switch ext {
             case "txt", "epub":
-                let repair = smartParse
                 let splitLong = splitLongSentences
                 let (sentences, fixes) = try await Task.detached(priority: .userInitiated) {
-                    try TextProcessor.parseBookFile(url: url, repair: repair, splitLong: splitLong)
+                    try TextProcessor.parseBookFile(url: url, splitLong: splitLong)
                 }.value
                 inputKind = .book(
                     title: url.deletingPathExtension().lastPathComponent,
@@ -624,15 +473,19 @@ final class AppModel: ObservableObject {
             case .subtitles(let t, _): return t
             }
         }()
-        let voiceCore: String
-        let voiceTag: String
-        if let aiName = selectedVoiceDisplayName {
-            voiceCore = aiName
-            voiceTag = "[AI]"
-        } else {
-            voiceCore = voices.first { $0.id == selectedVoiceID }?.name ?? "系统默认"
-            voiceTag = "[sys]"
-        }
+        let (voiceCore, voiceTag): (String, String) = {
+            switch selectedTTSEngine {
+            case .kokoro:
+                let raw = KokoroTTS.popularVoices.first { $0.id == selectedKokoroVoiceID }?.displayName.components(separatedBy: " ").first ?? selectedKokoroVoiceID
+                return (raw, "[Kokoro]")
+            case .edgeTTS:
+                let raw = EdgeTTS.popularVoices.first { $0.id == selectedEdgeVoiceID }?.displayName.components(separatedBy: " ").first ?? selectedEdgeVoiceID
+                return (raw, "[Edge]")
+            case .customAPI:
+                let raw = customAPISettings.voice.isEmpty ? customAPISettings.model : customAPISettings.voice
+                return (raw, "[API]")
+            }
+        }()
         let rateStr = String(format: "%.1f", speechRate)
         let pauseStr = String(format: "%.1fx", pauseScale)
 
@@ -768,35 +621,6 @@ final class AppModel: ObservableObject {
         return parts.trimmingCharacters(in: CharacterSet(charactersIn: " "))
     }
 
-    /// 当前选中的 AI 音色（nil = 使用系统声音）。若选中的是“目录条目但尚未下载”，返回 nil。
-    var selectedPiperVoice: PiperVoice? {
-        guard let id = selectedPiperVoiceID else { return nil }
-        // 直接命中已安装模型 id（en_US-lessac-medium）
-        if let m = piperModels.first(where: { $0.id == id }) { return m }
-        // 命中目录条目 id（en_US-lessac）→ 从已安装里按「语言-数据集」前缀找对应档位。
-        // 同一数据集可能装了多个质量档，优先选与当前「质量档」一致的那个，避免挑到无关档位。
-        if let e = piperCatalog.first(where: { $0.id == id }) {
-            let prefix = "\(e.language)-\(e.dataset)-"
-            if let q = piperModels.first(where: { $0.id == prefix + piperQuality.rawValue }) {
-                return q
-            }
-            return piperModels.first { $0.id.hasPrefix(prefix) }
-        }
-        return nil
-    }
-
-    /// 选中的目录条目（若选中值指向目录里的一个词条）。
-    var selectedCatalogEntry: PiperCatalogEntry? {
-        guard let id = selectedPiperVoiceID else { return nil }
-        return piperCatalog.first { $0.id == id }
-    }
-
-    /// 选中音色的“已显示名称”（渲染用 voiceCore；未下载时也用目录名）。
-    var selectedVoiceDisplayName: String? {
-        if let v = selectedPiperVoice { return v.displayName }
-        return selectedCatalogEntry?.displayName
-    }
-
     /// 获取当前生效的背景音乐文件（若是内置预设，则即时合成对应时长的环绕音轨）。
     private func resolveBGM(duration: Double) throws -> (url: URL, label: String, isTemp: Bool)? {
         switch bgmPreset {
@@ -866,12 +690,6 @@ final class AppModel: ObservableObject {
         }
 
         do {
-            // 若选中了「尚未下载」的 AI 音色，生成前先自动下载好，再进入渲染。
-            if let id = selectedPiperVoiceID, selectedPiperVoice == nil {
-                log("所选 AI 音色尚未下载，先生成前自动下载...")
-                _ = try await downloadCatalogEntryAndWait(id)
-                if cancelled() { return }
-            }
             switch (input, exportMode) {
             case (.book(_, let sentences), let mode):
                 let chapterRanges = TextProcessor.detectChaptersFromSentences(sentences: sentences)
@@ -936,10 +754,13 @@ final class AppModel: ObservableObject {
                 let result = try await engine.renderSubtitleAudio(
                     entries: entries,
                     outputURL: wavURL,
-                    voiceIdentifier: selectedVoiceID,
-                    piperVoice: selectedPiperVoice,
+                    engine: selectedTTSEngine,
+                    kokoroVoice: selectedTTSEngine == .kokoro ? selectedKokoroVoiceID : nil,
+                    edgeVoice: selectedTTSEngine == .edgeTTS ? selectedEdgeVoiceID : nil,
+                    customAPISettings: selectedTTSEngine == .customAPI ? customAPISettings : nil,
                     rate: speechRate,
                     overflowPolicy: subtitleOverflowPolicy,
+                    enableVocalWarmth: enableVocalWarmth,
                     progress: { [weak self] done, total in
                         self?.updateProgress(Double(done) / Double(max(total, 1)), text: "旁白抓轨 \(done)/\(total) 条")
                     },
@@ -962,10 +783,13 @@ final class AppModel: ObservableObject {
                 let result = try await engine.renderSubtitleAudio(
                     entries: entries,
                     outputURL: wavURL,
-                    voiceIdentifier: selectedVoiceID,
-                    piperVoice: selectedPiperVoice,
+                    engine: selectedTTSEngine,
+                    kokoroVoice: selectedTTSEngine == .kokoro ? selectedKokoroVoiceID : nil,
+                    edgeVoice: selectedTTSEngine == .edgeTTS ? selectedEdgeVoiceID : nil,
+                    customAPISettings: selectedTTSEngine == .customAPI ? customAPISettings : nil,
                     rate: speechRate,
                     overflowPolicy: subtitleOverflowPolicy,
+                    enableVocalWarmth: enableVocalWarmth,
                     progress: { [weak self] done, total in
                         self?.updateProgress(Double(done) / Double(max(total, 1)), text: "旁白抓轨 \(done)/\(total) 条")
                     },
@@ -1030,8 +854,10 @@ final class AppModel: ObservableObject {
                     let result = try await engine.renderSubtitleAudio(
                         entries: entries,
                         outputURL: wavURL,
-                        voiceIdentifier: selectedVoiceID,
-                        piperVoice: selectedPiperVoice,
+                        engine: selectedTTSEngine,
+                        kokoroVoice: selectedTTSEngine == .kokoro ? selectedKokoroVoiceID : nil,
+                        edgeVoice: selectedTTSEngine == .edgeTTS ? selectedEdgeVoiceID : nil,
+                        customAPISettings: selectedTTSEngine == .customAPI ? customAPISettings : nil,
                         rate: speechRate,
                         overflowPolicy: subtitleOverflowPolicy,
                         enableVocalWarmth: enableVocalWarmth,
@@ -1162,8 +988,10 @@ final class AppModel: ObservableObject {
         let result = try await engine.renderBook(
             sentences: sentences,
             outputURL: wavURL,
-            voiceIdentifier: selectedVoiceID,
-            piperVoice: selectedPiperVoice,
+            engine: selectedTTSEngine,
+            kokoroVoice: selectedTTSEngine == .kokoro ? selectedKokoroVoiceID : nil,
+            edgeVoice: selectedTTSEngine == .edgeTTS ? selectedEdgeVoiceID : nil,
+            customAPISettings: selectedTTSEngine == .customAPI ? customAPISettings : nil,
             rate: speechRate,
             pauseScale: pauseScale,
             enableVocalWarmth: enableVocalWarmth,
@@ -1299,17 +1127,17 @@ final class AppModel: ObservableObject {
         if logLines.count > 400 { logLines.removeFirst(logLines.count - 400) }
     }
 
-    /// 把解析期对原文的标点修复输出到日志：汇总统计 + 前若干条明细样例。
+    /// 把解析期对原文的结构调整输出到日志：汇总统计 + 前若干条明细样例。
     func logTextFixes(_ fixes: [TextFix]) {
         guard !fixes.isEmpty else { return }
-        let order: [TextFixKind] = [.stripBoilerplate, .skipTOC, .addPeriod, .fixBoundary, .collapseDuplicate, .splitLong]
+        let order: [TextFixKind] = [.stripBoilerplate, .skipTOC, .splitLong]
         let summary = order
             .compactMap { kind in
                 let n = fixes.filter { $0.kind == kind }.count
                 return n > 0 ? "\(kind.rawValue) \(n) 处" : nil
             }
             .joined(separator: " · ")
-        log("已调整原文: \(summary)（共 \(fixes.count) 处；仅影响解析结果，不修改原文件）")
+        log("文本结构处理: \(summary)（共 \(fixes.count) 处；仅影响断句，不修改原文标点）")
         for f in fixes.prefix(5) {
             let original = f.original.count > 24 ? f.original.prefix(24) + "…" : f.original
             let repaired = f.repaired.count > 24 ? f.repaired.prefix(24) + "…" : f.repaired
@@ -1362,10 +1190,6 @@ final class AppModel: ObservableObject {
 
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
-    // 左侧控制区滚动状态（可滚动区 0...1 的进度 + 是否溢出需要滚动条）
-    @State private var leftScrollFraction: Double = 0
-    @State private var leftScrollHasOverflow: Bool = false
-    @State private var showAIVoicePanel: Bool = false
 
     var body: some View {
         HSplitView {
@@ -1375,7 +1199,7 @@ struct ContentView: View {
                 .frame(minWidth: 520)
         }
         .frame(minWidth: 980, minHeight: 620)
-        .task { model.loadVoices() }
+        .task { model.initializeApp() }
         .alert(
             "发生错误",
             isPresented: Binding(
@@ -1410,21 +1234,10 @@ struct ContentView: View {
     // MARK: 左侧面板
 
     private var leftPanel: some View {
-        VStack(spacing: 0) {
-            LeftScrollHost(
-                scrollFraction: $leftScrollFraction,
-                hasOverflow: $leftScrollHasOverflow
-            ) {
-                leftScrollContent
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            // 底部滚动进度条：拖动可定位窗口高度被裁掉的左栏控件
-            if leftScrollHasOverflow {
-                leftScrollProgressBar
-            }
+        ScrollView(.vertical, showsIndicators: true) {
+            leftScrollContent
         }
         .padding(.top, 16)
-        .task { model.refreshPiper() }
     }
 
     /// 左栏可滚动内容（窗口高度不足时用进度条上下滚动定位下方被隐藏的控件）。
@@ -1432,24 +1245,15 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 14) {
             topActionSection
             infoBox
-            Toggle("智能解析（修复标点/合并折行）", isOn: $model.smartParse)
+            Toggle("智能拆分超长句（>60字/140词）", isOn: $model.splitLongSentences)
                 .font(.caption)
-            Toggle("拆分超长句（>60 字）", isOn: $model.splitLongSentences)
-                .font(.caption)
-                .onChange(of: model.smartParse) { _ in
-                    // 开关变化后重新解析当前输入，保证日志/句数即时更新
-                    if let url = model.inputURL {
-                        Task { await model.loadInput(url: url) }
-                    }
-                }
                 .onChange(of: model.splitLongSentences) { _ in
                     if let url = model.inputURL {
                         Task { await model.loadInput(url: url) }
                     }
                 }
             Divider()
-            voicePicker
-            aiVoiceSection
+            unifiedVoiceSection
             rateSlider
             bgmSection
             Divider()
@@ -1488,222 +1292,6 @@ struct ContentView: View {
         }
         .padding([.leading, .trailing], 16)
         .padding(.bottom, 10)
-    }
-
-    private var leftScrollProgressBar: some View {
-        ScrollProgressBar(
-            fraction: Binding(
-                get: { leftScrollFraction },
-                set: { leftScrollFraction = min(max($0, 0), 1) }
-            )
-        )
-        .frame(height: 24)
-    }
-
-    /// 本地 AI 音色（Piper）选择与安装。
-    private var aiVoiceSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // —— 入口头：点击展开/收起整个音色面板 ——
-            HStack(spacing: 6) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        showAIVoicePanel.toggle()
-                    }
-                } label: {
-                    HStack(spacing: 6) {
-                        Text("AI 音色（本地 · 离线）")
-                            .font(.caption)
-                            .foregroundStyle(.primary)
-                        Spacer()
-                        Text(aiVoiceSummary)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Image(systemName: showAIVoicePanel ? "chevron.up" : "chevron.down")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .buttonStyle(.plain)
-
-                if model.selectedPiperVoice != nil && !showAIVoicePanel {
-                    Button("试听") { model.previewPiperVoice() }
-                        .font(.caption2)
-                        .buttonStyle(.bordered)
-                        .disabled(model.isModelDownloading)
-                }
-            }
-
-            if showAIVoicePanel {
-                if model.piperEngineInstalled {
-                    aiVoiceInstalledPanel
-                } else {
-                    // 引擎未安装：只给安装 + 刷新
-                    HStack(spacing: 10) {
-                        if model.isPiperInstalling {
-                            Text("正在安装引擎...").font(.caption).foregroundStyle(.secondary)
-                        } else {
-                            Button("安装本地 AI 引擎（一次性，约 150MB）") { model.installPiperEngine() }
-                                .font(.caption)
-                        }
-                        Button("刷新") { model.refreshPiper(forceCatalog: true) }
-                            .font(.caption)
-                    }
-                    Text("引擎为本地神经网络 TTS（piper-tts），安装后合成完全离线")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
-        }
-    }
-
-    /// 入口头摘要：当前所选 AI 音色（或“未下载/使用系统声音”）。
-    private var aiVoiceSummary: String {
-        if let v = model.selectedPiperVoice { return "\(v.displayName) · \(v.language)" }
-        if let e = model.selectedCatalogEntry { return "\(e.displayName) · 未下载" }
-        return "使用系统声音"
-    }
-
-    /// 引擎已安装：统一音色列表 + 选中音色的操作条。
-    private var aiVoiceInstalledPanel: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // 统一音色列表（已安装打勾；目录未安装标“未下载”）
-            ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
-                    aiVoiceRow(
-                        label: "使用系统声音",
-                        installed: true,
-                        selected: model.selectedPiperVoiceID == nil
-                    ) {
-                        model.selectedPiperVoiceID = nil
-                        model.log("切换为系统声音")
-                        withAnimation(.easeInOut(duration: 0.2)) { showAIVoicePanel = false }
-                    } trailing: {
-                        EmptyView()
-                    }
-
-                    ForEach(model.piperModels) { v in
-                        aiVoiceRow(
-                            label: "\(v.displayName) · \(v.language)",
-                            installed: true,
-                            selected: model.selectedPiperVoiceID == v.id
-                        ) { [weak model] in
-                            model?.selectedPiperVoiceID = v.id
-                            model?.log("切换 AI 音色: \(v.displayName) · \(v.language)")
-                            withAnimation(.easeInOut(duration: 0.2)) { showAIVoicePanel = false }
-                        } trailing: {
-                            Image(systemName: "checkmark")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-
-                    ForEach(model.piperCatalog) { e in
-                        // 已安装的目录条目不重复列出
-                        let installed = model.piperModels.contains { $0.id.hasPrefix("\(e.language)-\(e.dataset)-") }
-                        if !installed {
-                            aiVoiceRow(
-                                label: "\(e.displayName) · \(e.language) · 未下载",
-                                installed: false,
-                                selected: model.selectedPiperVoiceID == e.id
-                            ) { [weak model] in
-                                model?.selectedPiperVoiceID = e.id
-                                model?.log("已选未下载音色 \(e.displayName) · 生成时自动下载")
-                                withAnimation(.easeInOut(duration: 0.2)) { showAIVoicePanel = false }
-                            } trailing: {
-                                Text("未下载")
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                    }
-                }
-                .padding(.vertical, 2)
-            }
-            .frame(maxHeight: 170)
-
-            if model.piperCatalog.isEmpty && !model.catalogLoadFailed {
-                Text("正在加载在线音色目录...").font(.caption2).foregroundStyle(.secondary)
-            }
-            if model.catalogLoadFailed {
-                Text("在线目录加载失败（网络），点「刷新」重试").font(.caption2).foregroundStyle(.secondary)
-            }
-
-            // 选中音色的操作条：试听 / 删除（已装）；下载（未装）；未选提示
-            HStack(spacing: 8) {
-                if let v = model.selectedPiperVoice {
-                    Button("试听") { model.previewPiperVoice() }
-                        .font(.caption)
-                        .disabled(model.isModelDownloading)
-                    Button("删除") { model.deletePiperVoice(v) }
-                        .font(.caption)
-                        .disabled(model.isModelDownloading)
-                } else if model.selectedPiperVoiceID != nil {
-                    Button("下载") { model.startSelectedVoiceDownload() }
-                        .font(.caption)
-                        .disabled(model.isModelDownloading)
-                    Text("选中未下载，生成时也会自动下载")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("未选择 AI 音色，将用系统声音")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                if model.isModelDownloading {
-                    Text("下载中...").font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("刷新") { model.refreshPiper(forceCatalog: true) }
-                    .font(.caption)
-            }
-
-            // 下载质量档位
-            HStack(spacing: 8) {
-                Text("质量档").font(.caption).foregroundStyle(.secondary)
-                Picker("质量", selection: $model.piperQuality) {
-                    ForEach(AppModel.PiperQuality.allCases) { q in
-                        Text(q.label).tag(q)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: 180)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    /// 音色列表单行：高亮当前选中的；点击选中。
-    private func aiVoiceRow(
-        label: String,
-        installed: Bool,
-        selected: Bool,
-        onSelect: @escaping () -> Void,
-        @ViewBuilder trailing: () -> some View
-    ) -> some View {
-        Button(action: onSelect) {
-            HStack(spacing: 6) {
-                Text(label)
-                    .font(.caption2)
-                    .foregroundStyle(selected ? Color.accentColor : .primary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer()
-                trailing()
-            }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 5)
-                    .fill(selected ? Color.accentColor.opacity(0.12) : Color.clear)
-            )
-            .contentShape(Rectangle())
-            .opacity(installed ? 1 : 0.75)
-        }
-        .buttonStyle(.plain)
     }
 
     /// 版本信息：如 v1.0.0(20260818_1146)。
@@ -1790,33 +1378,125 @@ struct ContentView: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
     }
 
-    private var voicePicker: some View {
-        VStack(alignment: .leading, spacing: 4) {
+    /// 全球多引擎 AI 语音选择系统
+    private var unifiedVoiceSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("系统声音").font(.caption).foregroundStyle(.secondary)
+                Text("AI 语音引擎").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("试听") { model.previewVoice() }
-                    .font(.caption)
-                    .disabled(model.selectedVoiceID == nil)
             }
-            Picker("声音", selection: Binding(
-                get: { model.selectedVoiceID },
-                set: { model.selectedVoiceID = $0; model.markVoicePickedByUser() }
-            )) {
-                ForEach(model.voices) { v in
-                    Text(voiceLabel(v)).tag(v.id as String?)
+            Picker("引擎", selection: $model.selectedTTSEngine) {
+                ForEach(TTSEngineType.allCases) { eng in
+                    Text(eng.label).tag(eng)
                 }
             }
             .labelsHidden()
+
+            switch model.selectedTTSEngine {
+            case .kokoro:
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Kokoro-82M 本地神经音色").font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("试听") { model.previewKokoroVoice() }
+                            .font(.caption)
+                    }
+                    Picker("音色", selection: $model.selectedKokoroVoiceID) {
+                        ForEach(KokoroTTS.popularVoices) { v in
+                            Text("\(v.displayName) [\(v.tag)]").tag(v.id)
+                        }
+                    }
+                    .labelsHidden()
+                    Text("💡 82M 本地顶级神经网络，0 网络依赖，媲美 ElevenLabs，无限时长稳定畅享")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+
+            case .edgeTTS:
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("微软 Neural 广播音色").font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("试听") { model.previewEdgeVoice() }
+                            .font(.caption)
+                    }
+                    Picker("音色", selection: $model.selectedEdgeVoiceID) {
+                        ForEach(EdgeTTS.popularVoices) { v in
+                            Text("\(v.displayName) [\(v.tag)]").tag(v.id)
+                        }
+                    }
+                    .labelsHidden()
+                    Text("💡 48kHz 广播级原声录制，免 API Key，支持全网顶流有声书主播")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+
+            case .customAPI:
+                customAPISection
+            }
         }
     }
 
-    private func voiceLabel(_ v: AppModel.VoiceInfo) -> String {
-        var label = "\(v.name) (\(v.language))"
-        if v.qualityRank > 1 {
-            label += " · \(v.qualityLabel)"
+    private var customAPISection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("服务商预设").font(.caption).foregroundStyle(.secondary)
+                Picker("服务商", selection: Binding(
+                    get: { model.customAPISettings.provider },
+                    set: { newP in
+                        model.customAPISettings.applyPreset(for: newP)
+                    }
+                )) {
+                    ForEach(CustomAPISettings.Provider.allCases) { p in
+                        Text(p.label).tag(p)
+                    }
+                }
+                .labelsHidden()
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("API Key").font(.caption).foregroundStyle(.secondary)
+                SecureField(model.customAPISettings.provider == .custom ? "可选 / sk-..." : "sk-...", text: $model.customAPISettings.apiKey)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("接口端点 URL").font(.caption).foregroundStyle(.secondary)
+                TextField("https://api.openai.com/v1/audio/speech", text: $model.customAPISettings.endpointURL)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("模型名称 (Model)").font(.caption).foregroundStyle(.secondary)
+                TextField("tts-1-hd", text: $model.customAPISettings.model)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("音色标识 (Voice ID)").font(.caption).foregroundStyle(.secondary)
+                TextField("onyx", text: $model.customAPISettings.voice)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+            }
+
+            HStack {
+                Text("💡 支持 OpenAI / 11Labs / 本地 GPU")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("测试并试听") { model.previewCustomAPIVoice() }
+                    .font(.caption)
+            }
         }
-        return label
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
     }
 
     private var colorPalette: some View {
@@ -2440,209 +2120,4 @@ struct PlayerView: NSViewRepresentable {
     }
 }
 
-// MARK: - 左侧控制区可滚动容器
-//
-// 左栏内容较多，当全局窗口高度小于内容高度时，下方的控制按钮会被裁掉而无法访问。
-// 这里用 NSScrollView 桥接：自带原生系统滚动条（滚轮/两指可滚），同时把滚动进度
-// （0...1）暴露给 SwiftUI，配合左下角的可拖动进度条，可直观定位被隐藏的控件。
 
-/// 跟随窗口宽度横向贴合、纵向可滚动的 NSScrollView。
-@MainActor
-private final class LeftFittingScrollView: NSScrollView {
-    override func layout() {
-        super.layout()
-        guard let doc = documentView else { return }
-        let clipW = contentView.bounds.width
-        var f = doc.frame
-        f.size.width = clipW
-        if f.size.height < contentView.bounds.height {
-            f.size.height = contentView.bounds.height
-        }
-        doc.frame = f
-    }
-}
-
-/// 左栏滚动容器的协调器：持有 NSScrollView + NSHostingController，负责把滚动进度
-/// 双向同步到 SwiftUI（滚轮滚动→上报进度；拖动进度条→按进度滚动），并上报是否溢出。
-@MainActor
-private final class LeftScrollCoordinator: NSObject {
-    let scrollView = LeftFittingScrollView()
-    let controller = NSHostingController(rootView: AnyView(EmptyView()))
-    /// 直接写回 SwiftUI 绑定（滚动进度 0...1 / 是否溢出）。
-    var onFractionWriteBack: ((Double) -> Void)?
-    var onOverflowWriteBack: ((Bool) -> Void)?
-    /// 上次应用（由进度条驱动）的进度，用于抑制回环。
-    var lastAppliedFraction: Double?
-    var lastReportedFraction: Double?
-    var lastReportedOverflow: Bool?
-
-    override init() {
-        super.init()
-        let sv = scrollView
-        sv.hasVerticalScroller = true
-        sv.hasHorizontalScroller = false
-        sv.autohidesScrollers = true
-        sv.scrollerStyle = .overlay
-        sv.drawsBackground = false
-        sv.borderType = .noBorder
-        sv.documentView = controller.view
-        sv.contentView.postsBoundsChangedNotifications = true
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(boundsDidChange(_:)),
-            name: NSView.boundsDidChangeNotification,
-            object: sv.contentView
-        )
-    }
-
-    @objc private func boundsDidChange(_ note: Notification) {
-        if let doc = scrollView.documentView {
-            var f = doc.frame
-            f.size.width = scrollView.contentView.bounds.width
-            doc.frame = f
-        }
-        refreshMetrics()
-    }
-
-    /// 计算当前滚动进度（0...1）与是否溢出，并回调给 SwiftUI。
-    func refreshMetrics(force: Bool = false) {
-        controller.view.layoutSubtreeIfNeeded()
-        let clipH = scrollView.contentView.bounds.height
-        let docH = controller.view.fittingSize.height
-        // 显式把文档高度设为内容自然高度（≥ 可视区），保证内容超出时真正可滚动。
-        if let doc = scrollView.documentView {
-            var f = doc.frame
-            f.size.width = scrollView.contentView.bounds.width
-            f.size.height = max(docH, clipH)
-            doc.frame = f
-        }
-        // 让 NSScrollView 按新文档尺寸重算滚动范围。
-        scrollView.reflectScrolledClipView(scrollView.contentView)
-        let maxScroll = max(docH - clipH, 0)
-        let overflow = maxScroll > 1
-        if overflow != lastReportedOverflow || force {
-            lastReportedOverflow = overflow
-            onOverflowWriteBack?(overflow)
-        }
-        let fr: Double = maxScroll > 0 ? Double(scrollView.contentView.bounds.origin.y / maxScroll) : 0
-        let clamped = min(max(fr, 0), 1)
-        if abs(clamped - (lastReportedFraction ?? -1)) > 0.0005 || force {
-            lastReportedFraction = clamped
-            onFractionWriteBack?(clamped)
-        }
-    }
-
-    /// 把内容视图及其滚动文档刷新为给定 SwiftUI 内容。
-    func setContent<Content: View>(_ content: Content) {
-        controller.rootView = AnyView(content)
-        controller.view.layoutSubtreeIfNeeded()
-        if let doc = scrollView.documentView {
-            var f = doc.frame
-            f.size.width = scrollView.contentView.bounds.width
-            doc.frame = f
-        }
-        refreshMetrics(force: true)
-    }
-
-    /// 按目标进度滚动（由底部进度条拖动触发）。
-    func applyFraction(_ target: Double) {
-        let clamped = min(max(target, 0), 1)
-        // 若与当前实际进度一致则跳过，避免回环。
-        refreshMetrics()
-        if abs(clamped - (lastReportedFraction ?? -1)) < 0.0005 {
-            lastAppliedFraction = clamped
-            return
-        }
-        let clipH = scrollView.contentView.bounds.height
-        let docH = controller.view.frame.height
-        let maxScroll = max(docH - clipH, 0)
-        lastAppliedFraction = clamped
-        scrollView.contentView.scroll(to: NSPoint(x: 0, y: clamped * maxScroll))
-        scrollView.reflectScrolledClipView(scrollView.contentView)
-    }
-}
-
-/// 把左栏内容包进可滚动区域，并向 SwiftUI 暴露滚动进度（0...1）与是否溢出。
-private struct LeftScrollHost<Content: View>: NSViewRepresentable {
-    @Binding var scrollFraction: Double
-    @Binding var hasOverflow: Bool
-    let content: Content
-    /// 绑定句柄（指向 @State 真实存储，供权威侧写回）。
-    private let fractionBinding: Binding<Double>
-    private let overflowBinding: Binding<Bool>
-
-    init(
-        scrollFraction: Binding<Double>,
-        hasOverflow: Binding<Bool>,
-        @ViewBuilder content: () -> Content
-    ) {
-        self._scrollFraction = scrollFraction
-        self._hasOverflow = hasOverflow
-        self.fractionBinding = scrollFraction
-        self.overflowBinding = hasOverflow
-        self.content = content()
-    }
-
-    func makeCoordinator() -> LeftScrollCoordinator { LeftScrollCoordinator() }
-
-    func makeNSView(context: Context) -> NSScrollView {
-        context.coordinator.scrollView
-    }
-
-    func updateNSView(_ nsView: NSScrollView, context: Context) {
-        let coordinator = context.coordinator
-        // 滚动进度 / 溢出直接写回 @State 真实存储（主线程自动，无回环：同值不重复应用）。
-        coordinator.onFractionWriteBack = { [fractionBinding] fr in
-            fractionBinding.wrappedValue = fr
-        }
-        coordinator.onOverflowWriteBack = { [overflowBinding] ov in
-            overflowBinding.wrappedValue = ov
-        }
-        // 内容更新（左栏全部控件 + 版本号）。
-        coordinator.setContent(content)
-        // 若底部进度条拖动改变了进度，则按目标滚动。
-        let target = scrollFraction
-        if abs(target - (coordinator.lastAppliedFraction ?? -1)) > 0.0005 {
-            coordinator.applyFraction(target)
-        }
-    }
-}
-
-/// 左栏底部的滚动进度条：Thumb 反映当前滚动进度，拖动即把左栏滚到对应位置，
-/// 用于定位窗口高度不足、被裁掉的隐藏控件。
-private struct ScrollProgressBar: View {
-    @Binding var fraction: Double
-
-    var body: some View {
-        GeometryReader { geo in
-            let width = geo.size.width
-            let thumb: CGFloat = 26
-            let travel = max(width - thumb, 1)
-            let x = CGFloat(fraction) * travel
-            ZStack(alignment: .leading) {
-                // 轨道
-                Capsule()
-                    .fill(Color.primary.opacity(0.08))
-                    .frame(height: 6)
-                    .frame(maxHeight: .infinity)
-                // Thumb
-                Capsule()
-                    .fill(Color.accentColor.opacity(0.75))
-                    .frame(width: thumb, height: 6)
-                    .offset(x: x)
-            }
-            .frame(height: 26, alignment: .center)
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { v in
-                        let clamped = min(max((v.location.x - thumb / 2) / travel, 0), 1)
-                        fraction = Double(clamped)
-                    }
-            )
-        }
-        .frame(height: 26)
-        .padding(.horizontal, 16)
-        .accessibilityLabel("左侧控制区滚动进度")
-    }
-}

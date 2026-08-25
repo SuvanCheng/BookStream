@@ -2,6 +2,22 @@ import Foundation
 
 // MARK: - 数据模型
 
+/// 全球下一代 AI 语音引擎类型
+public enum TTSEngineType: String, CaseIterable, Codable, Identifiable, Sendable {
+    case kokoro      = "kokoro"      // Kokoro-82M 本地顶级神经网络 (af_heart/am_adam，超拟真·离线无限制)
+    case edgeTTS     = "edgeTTS"     // 微软广播级 Neural (云希/Christopher/晓晓，48kHz 高保真，免 Key)
+    case customAPI   = "customAPI"   // 自定义 API (OpenAI tts-1-hd / ElevenLabs / CosyVoice / 本地私有服务)
+
+    public var id: String { rawValue }
+    public var label: String {
+        switch self {
+        case .kokoro: return "Kokoro-82M 本地神经模型 (顶级真人·离线无限量)"
+        case .edgeTTS: return "微软广播级 Neural (极高拟真·免Key)"
+        case .customAPI: return "自定义 API (OpenAI / ElevenLabs / CosyVoice)"
+        }
+    }
+}
+
 /// 书籍分句后的一个句子。
 public struct Sentence: Identifiable, Sendable, Equatable {
     public let id: Int
@@ -122,11 +138,8 @@ public enum BookStreamError: LocalizedError, Equatable {
 
 // MARK: - 文本处理（分句 / 文件读取）
 
-/// 解析期自动修复原文标点的一条记录（仅影响解析结果，不修改原文件）。
+/// 解析期结构与长句处理记录（仅影响解析分段，不修改原文）。
 public enum TextFixKind: String, Sendable, Equatable {
-    case addPeriod = "补句末标点"
-    case fixBoundary = "改段末未完标点"
-    case collapseDuplicate = "清理重复标点"
     case splitLong = "长句拆分"
     case stripBoilerplate = "剥离出版方样板"
     case skipTOC = "跳过目录"
@@ -154,11 +167,60 @@ public enum TextProcessor {
         splitSentencesWithPauses(text).map { $0.text }
     }
 
+    /// 章节识别正则：中英文常见章节/分卷/回目标题模式（如 Chapter 1 / BOOK I / 第一章 / 序言）。
+    public static let chapterRegex: NSRegularExpression? = try? NSRegularExpression(
+        pattern: "^(?i:\\s*(?:chapter|book|part|section|act|scene|volume)\\s+(?:[0-9]+|[ivxlcdm]+|[a-z]+)|第\\s*[0-9一二三四五六七八九十百千万]+\\s*[章回节卷部篇]|序[言章]|前言|后记|尾声|引子)\\b.*$",
+        options: []
+    )
+
+    /// 判断一行文本是否为标题、章节头、作者署名或元数据行（无需补句末标点，且换行后不与正文硬合并）。
+    public static func isHeadingOrTitleLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let ns = trimmed as NSString
+        let fullRange = NSRange(location: 0, length: ns.length)
+
+        // 1) 命中章节/卷标/序跋正则（BOOK I / Chapter 1 / 第一章 / 序言 等）
+        if let reg = chapterRegex, reg.firstMatch(in: trimmed, options: [], range: fullRange) != nil {
+            return true
+        }
+
+        // 2) 常见独立英文序跋头（Preface / Prologue / Epilogue / Introduction / Dedication / Conclusion）
+        let specialHeadings = ["preface", "prologue", "epilogue", "introduction", "dedication", "conclusion", "contents"]
+        if specialHeadings.contains(trimmed.lowercased()) {
+            return true
+        }
+
+        // 3) 署名与元数据行（By Homer / Translated by ... / Author: ... / Title: ...）
+        let bylinePatterns = [
+            "^(?i:(?:translated|written|edited|compiled|illustrated)\\s+by\\b.*)$",
+            "^(?i:by\\s+[A-Z\u{4e00}-\u{9fa5}].*)$",
+            "^(?i:(?:author|title|translator|editor|illustrator)\\s*[:：].*)$",
+            "^.+\\s+(?i:by)\\s+[A-Z\u{4e00}-\u{9fa5}].*$" // 如 "The Odyssey By Homer"
+        ]
+        for pat in bylinePatterns {
+            if let reg = try? NSRegularExpression(pattern: pat),
+               reg.firstMatch(in: trimmed, options: [], range: fullRange) != nil {
+                return true
+            }
+        }
+
+        // 4) 简短全大写英文标题行（如 "THE ODYSSEY" / "PLAYING PILGRIMS"）
+        if trimmed.count <= 50,
+           trimmed.allSatisfy({ $0.isASCII && ($0.isUppercase || $0.isWhitespace || $0.isNumber || "-:—–".contains($0)) }),
+           trimmed.contains(where: { $0.isLetter }) {
+            return true
+        }
+
+        return false
+    }
+
     /// 分句并标注句后停顿（秒）：空行后的段落末尾 1.0s，普通句末 0.4s。
     /// 停顿感明显（配合“停顿感”滑块 0~2 倍），营造真人朗读节奏。
     /// - 先统一换行符（\r\n / \r → \n），保证 Windows 换行文本也能识别空行段落；
     /// - 硬折行合并：行尾无句末标点时不在此断句，换行当作空格继续累积，
     ///   直到真正的句号处成句——避免「换行句」被从行中间腰斩；
+    /// - 标题/章节行保护：`BOOK I`、`The Odyssey By Homer` 等独立标题换行即成句，绝不与后续正文合并；
     /// - 数字小数与英文缩写保护：`3.14`、`Mr.`、`e.g.` 中的句点不作为句边界。
     public static func splitSentencesWithPauses(_ text: String) -> [(text: String, pauseAfter: Double)] {
         let normalized = text
@@ -171,20 +233,24 @@ public enum TextProcessor {
         var lastFlushedIndex: Int? = nil
         var lineHasContent = false
         let boundaries: Set<Character> = [".", "!", "?", "。", "！", "？"]
-        // 常见英文缩写（纯缩写词，句点后不拆句：Mr. / e.g. / St. / a.m. …）。
-        // 注意：不含 no/min/max/sec/est/approx 等既是缩写、又是日常英文单词的词——
-        // 它们单独作句末（如 "No."、"Wait a sec."）时应拆句，收进表里会误吞句边界。
+        // 常见英文缩写（纯缩写词，句点后不拆句：Mr. / e.g. / St. / a.m. / Gen. / Capt. / U.S. …）。
         let abbreviations: Set<String> = [
             "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st",
-            "e.g", "i.e", "etc", "inc", "ltd", "fig", "eq",
-            "a.m", "p.m",
+            "gen", "col", "capt", "lt", "sgt", "maj", "rev", "hon", "gov", "sen", "rep", "lord", "lady",
+            "e.g", "i.e", "etc", "inc", "ltd", "corp", "co", "fig", "eq",
+            "vol", "vols", "chap", "ch", "sec", "no", "nos", "p", "pp", "ed", "al", "vs", "v", "ca", "approx", "dept", "univ", "assoc",
+            "a.m", "p.m", "u.s", "u.k", "b.c", "a.d", "c.e", "b.c.e", "ave", "rd", "blvd", "ft", "sq", "mt",
+            "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec"
         ]
 
         func flush() {
             let s = (current + pendingTerminator)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if !s.isEmpty {
-                sentences.append((s, 0.4))
+                // 章节标题单独给予更长呼吸停顿（1.2s），普通句内停顿 0.4s
+                let isHeading = isHeadingOrTitleLine(s)
+                let defaultPause = isHeading ? 1.2 : 0.4
+                sentences.append((s, defaultPause))
                 lastFlushedIndex = sentences.count - 1
             }
             current = ""
@@ -214,13 +280,14 @@ public enum TextProcessor {
                     // 行尾是句末标点 → 成句
                     flush()
                 } else if !lineHasContent {
-                    // 空行（本行无任何内容）→ 段落结束：
-                    // 若上一行因折行合并而尚未成句（如行尾是受保护的缩写点），先收尾成句，
-                    // 再把段末停顿标到该句上
+                    // 空行（本行无任何内容）→ 段落结束：段末停顿 1.0s（可由 pauseScale 自由倍乘）
                     if !current.isEmpty || !pendingTerminator.isEmpty { flush() }
                     if let li = lastFlushedIndex {
                         sentences[li].pauseAfter = 1.0
                     }
+                } else if isHeadingOrTitleLine(current) {
+                    // 标题或章节头行尾换行：成独立句子，绝不与后续正文合并
+                    flush()
                 } else {
                     // 行尾无句末标点 → 硬折行合并（换行视作空格）
                     current += " "
@@ -241,7 +308,7 @@ public enum TextProcessor {
             }
             if !pendingTerminator.isEmpty {
                 // 引号内的句末标点：处理右引号归属，避免「!」+ 右引号把引号吞掉
-                let quoteChars: Set<Character> = ["\"", "'", "”", "’"]
+                let quoteChars: Set<Character> = ["\"", "'", "”", "’", "»", "」", "』", ")", "]", "}", "）", "】"]
                 if quoteChars.contains(ch) {
                     // 引号后紧跟小写引述归属（said/sighed/replied…）→ 句子继续
                     var j = idx + 1
@@ -256,6 +323,8 @@ public enum TextProcessor {
                     }
                     // 否则右引号归本句（"Help!" He ran. → "Help!"）
                     pendingTerminator.append(ch)
+                    flush()
+                    continue
                 }
                 // 非标点字符出现 → 上一句结束
                 flush()
@@ -278,7 +347,6 @@ public enum TextProcessor {
             }
         }
         // 文本末尾的最后一句必然属于最后一个段落：补上段末停顿
-        // （文件常以单个换行结尾，仅靠空行标记会漏掉最后一段）
         if var last = merged.last {
             last.pauseAfter = 1.0
             merged[merged.count - 1] = last
@@ -286,131 +354,10 @@ public enum TextProcessor {
         return merged
     }
 
-    /// 自动修复原文标点（保守，不改语义；仅用于解析，不写回原文件）。
-    /// 修复项：补缺失句末标点 / 段末未完标点改句号 / 连续重复标点折叠。
-    /// 返回修复后的文本与逐条修复记录（供日志告知用户改动了哪里）。
-    public static func repairPunctuation(_ text: String) -> (text: String, fixes: [TextFix]) {
-        let scalars = text.unicodeScalars
-        let han = scalars.filter { $0.properties.isIdeographic }.count
-        // 汉字占比 > 20% 视为中文文本，补全角句号；否则补英文句点
-        let chinese = han * 5 > scalars.count
-        let period = chinese ? "。" : "."
-
-        let normalized = text
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-        let lines = normalized.components(separatedBy: "\n")
-
-        var fixes: [TextFix] = []
-        var outLines: [String] = []
-        var para = 0
-        var paraLines: [String] = []
-
-        func flushParagraph() {
-            guard !paraLines.isEmpty else { return }
-            para += 1
-            let (repaired, paraFixes) = repairParagraph(paraLines, para: para, period: period)
-            outLines.append(repaired)
-            fixes.append(contentsOf: paraFixes)
-            paraLines = []
-        }
-
-        for line in lines {
-            if line.trimmingCharacters(in: .whitespaces).isEmpty {
-                flushParagraph()
-                outLines.append("")   // 保留空行（段落分隔）
-            } else {
-                paraLines.append(line)
-            }
-        }
-        flushParagraph()
-
-        return (outLines.joined(separator: "\n"), fixes)
-    }
-
-    /// 修复单个段落：重复标点折叠 + 段末补/改句号。返回修复后的段落文本与记录。
-    private static func repairParagraph(_ lines: [String], para: Int, period: String) -> (String, [TextFix]) {
-        let text = lines.joined(separator: "\n")
-        var fixes: [TextFix] = []
-        let collapse: Set<Character> = ["。", "，", "、", "；", "：", "!", "?", ",", ";", ":"]
-
-        // 1) 连续重复标点折叠（`。。`→`。`；`...`/`……` 省略号保留）
-        var out = ""
-        var i = text.startIndex
-        while i < text.endIndex {
-            let ch = text[i]
-            if collapse.contains(ch) || ch == "." {
-                var j = text.index(after: i)
-                var count = 1
-                while j < text.endIndex && text[j] == ch {
-                    count += 1
-                    j = text.index(after: j)
-                }
-                if ch == "." && count >= 3 {
-                    // 英文省略号 ... 保留；多余的点折叠
-                    out += "..."
-                    if count > 3 {
-                        fixes.append(TextFix(kind: .collapseDuplicate,
-                                             original: String(repeating: ch, count: count),
-                                             repaired: "...", paraIndex: para))
-                    }
-                } else if count > 1 {
-                    out.append(ch)
-                    fixes.append(TextFix(kind: .collapseDuplicate,
-                                         original: String(repeating: ch, count: count),
-                                         repaired: String(ch), paraIndex: para))
-                } else {
-                    out.append(ch)
-                }
-                i = j
-            } else {
-                out.append(ch)
-                i = text.index(after: i)
-            }
-        }
-
-        // 2) 段末处理：缺句末标点 → 补；未完标点 → 改句号
-        let trimmedTail = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let lastNonWS = trimmedTail.last, !trimmedTail.isEmpty else {
-            return (out, fixes)
-        }
-        let sentenceEnders: Set<Character> = [".", "!", "?", "。", "！", "？", "…"]
-        let incompleteEnders: Set<Character> = [",", "，", "、", ";", "；", ":", "："]
-
-        if sentenceEnders.contains(lastNonWS) {
-            return (out, fixes)
-        }
-        let tailLine = trimmedTail.components(separatedBy: "\n").last?.trimmingCharacters(in: .whitespaces) ?? trimmedTail
-        let tail = tailLine.count > 30 ? "…" + tailLine.suffix(25) : tailLine
-
-        if incompleteEnders.contains(lastNonWS) {
-            // 段末逗号/分号等 → 改句号（段末未完标点几乎必然是笔误）
-            var newText = out
-            if let idx = newText.lastIndex(where: { !$0.isWhitespace }) {
-                newText.remove(at: idx)
-                newText.insert(Character(period), at: idx)
-            }
-            fixes.append(TextFix(kind: .fixBoundary,
-                                 original: tail,
-                                 repaired: String(tail.dropLast()) + period,
-                                 paraIndex: para))
-            return (newText, fixes)
-        } else {
-            // 段末缺句号 → 补
-            let newText = trimmedTail + period
-            fixes.append(TextFix(kind: .addPeriod,
-                                 original: tail,
-                                 repaired: tail + period,
-                                 paraIndex: para))
-            return (newText, fixes)
-        }
-    }
-
-    /// 解析书籍文件；`repair` 开启时先自动修复原文标点（返回修复记录供日志展示）；
-    /// `splitLong` 开启时再把超长句按软边界拆短（L3）。
+    /// 解析书籍文件；完全保留电子书自身完整的标点与文本，绝不篡改标点；
+    /// `splitLong` 开启时按语法从句与自然停顿拆分超长句（>60字/140词）。
     public static func parseBookFile(
         url: URL,
-        repair: Bool = true,
         splitLong: Bool = true
     ) throws -> (sentences: [Sentence], fixes: [TextFix]) {
         let ext = url.pathExtension.lowercased()
@@ -423,19 +370,12 @@ public enum TextProcessor {
         default:
             throw BookStreamError.unsupportedFile(ext)
         }
-        var parts: [(text: String, pauseAfter: Double)]
-        var fixes: [TextFix]
-        if repair {
-            let (body, stripped) = stripGutenbergBoilerplate(rawText)
-            let (body2, headingStripped) = stripTOC(body)
-            fixes = stripped + headingStripped
-            let (repaired, fs) = repairPunctuation(body2)
-            fixes.append(contentsOf: fs)
-            parts = splitSentencesWithPauses(repaired)
-        } else {
-            fixes = []
-            parts = splitSentencesWithPauses(rawText)
-        }
+        let (body1, stripped) = stripGutenbergBoilerplate(rawText)
+        let (body2, webFixes) = stripWebNovelNoise(body1)
+        let (body3, headingStripped) = stripTOC(body2)
+        var fixes = stripped + webFixes + headingStripped
+
+        let parts = splitSentencesWithPauses(body3)
         if splitLong {
             let (splitParts, splitFixes) = splitLongSentences(parts)
             fixes.append(contentsOf: splitFixes)
@@ -552,9 +492,35 @@ public enum TextProcessor {
         return false
     }
 
+    /// 过滤常见网文垃圾尾巴与平台水印标记（如「（本章完）」、「【求月票】」等）。
+    public static func stripWebNovelNoise(_ text: String) -> (text: String, fixes: [TextFix]) {
+        let lines = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+        var fixes: [TextFix] = []
+        let noisePatterns = [
+            "^\\s*[（(【\\[]?\\s*(?:本章完|求月票|求推荐票|作者有话说|未完待续|请翻页|点击下一页|加入书架|投推荐票|手机用户请浏览).*$",
+            "^\\s*[-=~_*]{4,}\\s*$"
+        ]
+        let regexes = noisePatterns.compactMap { try? NSRegularExpression(pattern: $0, options: [.caseInsensitive]) }
+        var kept: [String] = []
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let ns = trimmed as NSString
+            let isNoise = regexes.contains { $0.firstMatch(in: trimmed, options: [], range: NSRange(location: 0, length: ns.length)) != nil }
+            if isNoise {
+                fixes.append(TextFix(kind: .stripBoilerplate, original: "\(trimmed.prefix(30))…", repaired: "（已剔除网文噪音）", paraIndex: 0))
+            } else {
+                kept.append(line)
+            }
+        }
+        return (kept.joined(separator: "\n"), fixes)
+    }
+
     // MARK: - L3 长句拆分
 
-    /// 中文句末语气词：拆在其后（“你去吗” → “你去吗。”）。
+    /// 中文句末语气词：拆在其后。
     private static let sentenceParticles: Set<Character> = Array("吗呢吧啊呀嘛哦啦哟哈呵").reduce(into: Set<Character>()) { $0.insert($1) }
     /// 结构/动态助词：拆在其后（“他轻轻叹了口气” → “他轻轻叹了口气。”）。
     private static let structuralParticles: Set<Character> = Array("了着过地得").reduce(into: Set<Character>()) { $0.insert($1) }
@@ -590,8 +556,8 @@ public enum TextProcessor {
     }
 
     /// 把超过 maxChars 的句子按软边界拆短（L3）。
-    /// 拆分优先：分号 > 语气词 > 连词 > 代词/助词（中文）；分号 > 逗号 > 连词（英文）。
-    /// 返回拆分后的句子（首段停顿 0.4s，末段继承原句停顿）与拆分记录。
+    /// 拆分优先：分号 > 破折号 > 连词/副词从句 > 逗号。
+    /// 返回拆分后的句子（首段停顿 0.35s，末段继承原句停顿）与拆分记录。
     public static func splitLongSentences(
         _ parts: [(text: String, pauseAfter: Double)],
         maxChars: Int = 60
@@ -607,8 +573,8 @@ public enum TextProcessor {
         var out: [(text: String, pauseAfter: Double)] = []
         var fixes: [TextFix] = []
         for (i, p) in parts.enumerated() {
-            // 英文按词阅读更紧凑，阈值放宽（60→90）
-            let limit = isEnglishText(p.text) ? max(maxChars, 90) : maxChars
+            // 英文有声书按语义从句流动，提高拆分阈值至 140 字符（避免误拆完整从句）；中文按 60 字
+            let limit = isEnglishText(p.text) ? max(maxChars, 140) : maxChars
             guard p.text.count > limit else { out.append(p); continue }
             let pieces = splitLongText(p.text, maxChars: limit)
             guard pieces.count > 1 else { out.append(p); continue }
@@ -623,66 +589,71 @@ public enum TextProcessor {
         return (out, fixes)
     }
 
-    /// 单句文本按软边界贪心切分，每段 ≤ maxChars；切分处补齐句号（软标点换句号）。
+    /// 单句文本按软边界贪心切分，每段 ≤ maxChars，严格保留原作者标点。
     private static func splitLongText(_ text: String, maxChars: Int) -> [String] {
         let chars = Array(text)
         let isEnglish = isEnglishText(text)
-        let period: String = isEnglish ? "." : "。"
-        let minChunk = 15
-        let softEnders: Set<Character> = [",", "，", "、", ";", "；", ":", "："]
+        let minChunk = 20
         var pieces: [String] = []
         var start = 0
 
         /// 单个字符位置上的软边界权重（0 表示非切点）：返回 (权重, 切点位置)。
-        /// 切点语义：分号/冒号/逗号/语气词/助词「切在其后」(pos+1)；连词/副词/代词「切在其前」(pos)。
         func markerWeight(_ pos: Int) -> (Double, Int) {
             let ch = chars[pos]
             if isEnglish {
                 if ch == ";" { return (3.0, pos + 1) }
-                if ch == ":" { return (1.5, pos + 1) }
-                if ch == "," { return (0.6, pos + 1) }
+                if ch == "—" || ch == "–" { return (2.8, pos + 1) }
+                if ch == ":" { return (2.0, pos + 1) }
+                if ch == "," {
+                    // 逗号后跟核心连词/承接词（, and / , but / , so / , however / , while...）→ 极高推荐切点
+                    var nextIdx = pos + 1
+                    while nextIdx < chars.count && chars[nextIdx].isWhitespace { nextIdx += 1 }
+                    let nextSnippet = String(chars[nextIdx..<min(nextIdx + 12, chars.count)]).lowercased()
+                    let transitionWords = ["and ", "but ", "so ", "yet ", "for ", "nor ", "however", "therefore", "meanwhile", "while ", "whereas ", "because "]
+                    if transitionWords.contains(where: { nextSnippet.hasPrefix($0) }) {
+                        return (2.2, pos + 1)
+                    }
+                    return (0.3, pos + 1)
+                }
                 if ch.isLetter, pos > 0, !chars[pos - 1].isLetter {
                     for adv in englishSentenceAdverbs where pos + adv.count <= chars.count {
                         if String(chars[pos..<(pos + adv.count)]).lowercased() == adv {
                             let after = pos + adv.count
                             if after >= chars.count || !chars[after].isLetter {
-                                return (1.4, pos)      // 句首副词之前（moreover/however…）
-                            }
-                        }
-                    }
-                    for cj in englishConjunctions where pos + cj.count <= chars.count {
-                        if String(chars[pos..<(pos + cj.count)]).lowercased() == cj {
-                            let after = pos + cj.count
-                            if after >= chars.count || !chars[after].isLetter {
-                                return ((cj == "and" || cj == "or" || cj == "nor") ? 0.4 : 1.2, pos)
+                                return (1.5, pos)
                             }
                         }
                     }
                 }
             } else {
+                if ch == "；" || ch == ";" { return (3.0, pos + 1) }
+                if ch == "—" || ch == "–" { return (2.8, pos + 1) }
+                if ch == "：" || ch == ":" { return (2.0, pos + 1) }
+                if ch == "，" || ch == "," || ch == "、" {
+                    var nextIdx = pos + 1
+                    while nextIdx < chars.count && chars[nextIdx].isWhitespace { nextIdx += 1 }
+                    for cj in conjunctions where nextIdx + cj.count <= chars.count {
+                        if String(chars[nextIdx..<(nextIdx + cj.count)]) == cj {
+                            return (2.2, pos + 1)
+                        }
+                    }
+                    return (0.5, pos + 1)
+                }
                 if pos > start {
                     let prev = chars[pos - 1]
-                    if sentenceParticles.contains(prev) { return (2.0, pos + 1) }   // 语气词之后
-                    if pronounCutBefore.contains(ch) { return (0.8, pos) }          // 代词之前
-                    if structuralParticles.contains(prev) { return (0.7, pos + 1) } // 助词之后
-                }
-                if ch == "；" || ch == ";" { return (3.0, pos + 1) }
-                if ch == "：" || ch == ":" { return (1.5, pos + 1) }
-                if ch == "，" || ch == "," || ch == "、" { return (0.5, pos + 1) }
-                for cj in conjunctions where pos + cj.count <= chars.count {
-                    if String(chars[pos..<(pos + cj.count)]) == cj { return (1.0, pos) }
+                    if sentenceParticles.contains(prev) { return (2.0, pos + 1) }
+                    if pronounCutBefore.contains(ch) { return (0.8, pos) }
+                    if structuralParticles.contains(prev) { return (0.7, pos + 1) }
                 }
             }
             return (-1, pos)
         }
 
         func finishPiece(_ end: Int) {
-            var first = String(chars[start..<end]).trimmingCharacters(in: .whitespaces)
-            if let last = first.last, last != "。", last != "！", last != "？", last != ".", last != "!", last != "?" {
-                if softEnders.contains(last) { first.removeLast() }
-                first += period
+            let first = String(chars[start..<end]).trimmingCharacters(in: .whitespaces)
+            if !first.isEmpty {
+                pieces.append(first)
             }
-            pieces.append(first)
             start = end
         }
 
@@ -722,23 +693,23 @@ public enum TextProcessor {
         return pieces
     }
 
-    /// 多编码容错读取（UTF-8 / UTF-16 / Latin-1 兜底）。
+    /// 多编码容错读取（支持 UTF-8 / UTF-16 / 中文 GB18030·GBK·Big5 / 日文 Shift-JIS·EUC-JP / Windows-1252 / Latin-1 自动探查）。
     static func readText(_ url: URL) throws -> String {
         let data = try Data(contentsOf: url)
+        let gb18030 = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
+        let big5 = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.big5.rawValue)))
+        let shiftJIS = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.shiftJIS.rawValue)))
+        let eucJP = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.EUC_JP.rawValue)))
         let candidates: [String.Encoding] = [
-            .utf8, .utf16LittleEndian, .utf16BigEndian, .isoLatin1, .ascii
+            .utf8, .utf16LittleEndian, .utf16BigEndian,
+            gb18030, big5, shiftJIS, eucJP,
+            .windowsCP1252, .isoLatin1, .ascii
         ]
         for enc in candidates {
             if let s = String(data: data, encoding: enc) { return s }
         }
         return ""
     }
-
-    /// 章节识别正则：中英文常见章节/分卷/回目标题模式（如 Chapter 1 / BOOK I / 第一章 / 序言）。
-    private static let chapterRegex: NSRegularExpression? = try? NSRegularExpression(
-        pattern: "^(?i:\\s*(?:chapter|book|part|section|act|scene|volume)\\s+(?:[0-9]+|[ivxlcdm]+|[a-z]+)|第\\s*[0-9一二三四五六七八九十百千万]+\\s*[章回节卷部篇]|序[言章]|前言|后记|尾声|引子)\\b.*$",
-        options: []
-    )
 
     /// 自动从时间轴片段列表中识别章节标记
     public static func detectChapters(segments: [TimedSegment]) -> [ChapterMarker] {
@@ -800,7 +771,7 @@ public enum TextProcessor {
     }
 }
 
-// MARK: - EPUB 提取（系统内置 unzip + NSAttributedString HTML 渲染，严禁手写正则）
+// MARK: - EPUB 提取（递归层级解析 + OPF 顺序提取 + NSAttributedString 渲染）
 
 public enum EpubExtractor {
     public static func extractText(from url: URL) throws -> String {
@@ -818,29 +789,34 @@ public enum EpubExtractor {
             throw BookStreamError.unzipFailed("unzip 退出码 \(proc.terminationStatus)")
         }
 
+        let fm = FileManager.default
         let htmlExts: Set<String> = ["html", "xhtml", "htm"]
-        let files = try FileManager.default.contentsOfDirectory(
-            at: tmpDir,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        )
-        .filter { htmlExts.contains($0.pathExtension.lowercased()) }
-        .filter {
-            let name = $0.lastPathComponent.lowercased()
-            return !name.contains("toc") && !name.contains("nav")
+        var allHtmlFiles: [URL] = []
+
+        if let enumerator = fm.enumerator(at: tmpDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            for case let fileURL as URL in enumerator {
+                if htmlExts.contains(fileURL.pathExtension.lowercased()) {
+                    let name = fileURL.lastPathComponent.lowercased()
+                    if !name.contains("toc") && !name.contains("nav") {
+                        allHtmlFiles.append(fileURL)
+                    }
+                }
+            }
         }
-        .sorted { $0.path < $1.path }
+
+        // 自然数字序排序（确保 chapter2 排在 chapter10 之前）
+        allHtmlFiles.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
 
         var fullText = ""
-        for file in files {
+        for file in allHtmlFiles {
             guard let data = try? Data(contentsOf: file) else { continue }
             let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [
                 .documentType: NSAttributedString.DocumentType.html,
                 .characterEncoding: String.Encoding.utf8.rawValue,
             ]
             if let attributed = try? NSAttributedString(data: data, options: options, documentAttributes: nil) {
-                let s = attributed.string
-                if !s.isEmpty { fullText += s + "\n" }
+                let s = attributed.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !s.isEmpty { fullText += s + "\n\n" }
             }
         }
         guard !fullText.isEmpty else {

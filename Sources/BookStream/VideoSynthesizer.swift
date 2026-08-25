@@ -1163,20 +1163,140 @@ public final class VideoRenderer: @unchecked Sendable {
             }
         }
 
-        // 深空星尘微光微粒背景（平缓飘浮、微弱呼吸感）
+        // 深空微光呼吸与三维星尘微粒系统（星云柔光呼吸 + 3 层精细景深星尘 + 柔焦微光 + 文字区保护 + 偶现微光流星）
         if enableParticles {
-            for p in 0..<36 {
+            // 分辨率精细自适应缩放（480p->1.0, 720p->1.33, 1080p->2.0）
+            let uiScale = max(1.0, min(canvas.width, canvas.height) / 540.0)
+
+            // 1. 宇宙星云暗光呼吸律动 (Nebula Breathing Ambient Glow)
+            // 4.5 秒超慢正弦呼吸周期，极弱微光起伏（透明度 0.035 ~ 0.065，静谧深邃）
+            let breath = sin(time * 1.396)
+            let breathAlpha = CGFloat(0.04 + 0.022 * breath)
+            let nebulaCenter = CGPoint(
+                x: canvas.width * CGFloat(0.5 + 0.05 * sin(time * 0.35)),
+                y: canvas.height * CGFloat(0.55 + 0.04 * cos(time * 0.3))
+            )
+            let maxRadius = max(canvas.width, canvas.height) * 0.85
+            let nebulaColor: NSColor
+            switch theme {
+            case .darkGradient, .pureBlack:
+                nebulaColor = NSColor(calibratedRed: 0.10, green: 0.20, blue: 0.42, alpha: breathAlpha)
+            case .midnightPurple:
+                nebulaColor = NSColor(calibratedRed: 0.28, green: 0.12, blue: 0.44, alpha: breathAlpha)
+            case .charcoal:
+                nebulaColor = NSColor(calibratedRed: 0.24, green: 0.20, blue: 0.16, alpha: breathAlpha)
+            }
+            let nebulaColors = [nebulaColor.cgColor, nebulaColor.withAlphaComponent(0.0).cgColor] as CFArray
+            if let nebulaGrad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: nebulaColors, locations: [0.0, 1.0]) {
+                ctx.drawRadialGradient(
+                    nebulaGrad,
+                    startCenter: nebulaCenter,
+                    startRadius: 0,
+                    endCenter: nebulaCenter,
+                    endRadius: maxRadius,
+                    options: [.drawsAfterEndLocation]
+                )
+            }
+
+            // 2. 偶现深空极低频微光流星（每 90 秒自然周期内偶现一次，持续 0.60 秒，极淡极细）
+            let meteorCycle = 90.0
+            let epoch = Int(time / meteorCycle)
+            let meteorTime = time.truncatingRemainder(dividingBy: meteorCycle)
+            let meteorDuration = 0.60
+            // 每轮周期在 25s ~ 65s 的不同伪随机时刻自然掠过
+            let offsetWithinCycle = 25.0 + Double((epoch * 3719 + 541) % 40)
+            if meteorTime >= offsetWithinCycle && meteorTime < offsetWithinCycle + meteorDuration {
+                let mp = (meteorTime - offsetWithinCycle) / meteorDuration // 0...1
+                let angleSeed = Double((epoch * 1973 + 109) % 100) / 100.0
+                let startX = canvas.width * CGFloat(0.70 + 0.20 * angleSeed)
+                let startY = canvas.height * CGFloat(0.82 + 0.12 * (1.0 - angleSeed))
+                let travelX = -canvas.width * CGFloat(0.32 + 0.12 * angleSeed)
+                let travelY = -canvas.height * CGFloat(0.24 + 0.08 * (1.0 - angleSeed))
+                let headX = startX + CGFloat(mp) * travelX
+                let headY = startY + CGFloat(mp) * travelY
+                let tailLen: CGFloat = 38.0 * uiScale
+                let tailX = headX - travelX * (tailLen / max(canvas.width, 1))
+                let tailY = headY - travelY * (tailLen / max(canvas.height, 1))
+                let mAlpha = CGFloat(sin(mp * .pi) * 0.20) // 恢复极淡微光
+
+                let meteorPath = CGMutablePath()
+                meteorPath.move(to: CGPoint(x: tailX, y: tailY))
+                meteorPath.addLine(to: CGPoint(x: headX, y: headY))
+                ctx.saveGState()
+                ctx.setStrokeColor(NSColor(calibratedRed: 0.88, green: 0.94, blue: 1.0, alpha: mAlpha).cgColor)
+                ctx.setLineWidth(1.1 * uiScale)
+                ctx.setLineCap(.round)
+                ctx.addPath(meteorPath)
+                ctx.strokePath()
+                ctx.restoreGState()
+            }
+
+            // 3. 3D 三层精细景深星尘微粒体系（多频谐波自然微风漂移，42 颗星尘）
+            for p in 0..<42 {
                 let seedX = Double((p * 7919 + 137) % 1000) / 1000.0
-                let seedSpeed = 0.06 + Double((p * 3571) % 100) / 1500.0
+                let seedSpeed = 0.032 + Double((p * 3571) % 100) / 2200.0
                 let seedPhase = Double((p * 2909) % 100) / 100.0
-                let py = (Double(time * seedSpeed) + seedPhase).truncatingRemainder(dividingBy: 1.0)
-                let px = seedX + 0.025 * sin(time * 0.7 + seedPhase * 6.28)
+                // 垂直微重力浮力微扰
+                let vertBuoyancy = 0.004 * sin(time * 0.35 + seedPhase * 4.71)
+                let rawY = (Double(time * seedSpeed) + seedPhase + vertBuoyancy).truncatingRemainder(dividingBy: 1.0)
+                let py = rawY < 0 ? rawY + 1.0 : rawY
+
+                // 三频谐波自然微风横向飘动（主横风 + 次级微扰 + 细微气流波动）
+                let px = seedX
+                    + 0.016 * sin(time * 0.42 + seedPhase * 6.28)
+                    + 0.007 * cos(time * 0.24 + seedPhase * 3.14)
+                    + 0.003 * sin(time * 0.78 + seedPhase * 1.57)
                 let x = CGFloat(px) * canvas.width
                 let y = CGFloat(py) * canvas.height
-                let pAlpha = CGFloat(max(0.04, 0.12 + 0.14 * sin(time * 1.8 + seedPhase * 6.28)))
-                let pSize = CGFloat(1.2 + Double(p % 3) * 0.7)
-                ctx.setFillColor(NSColor.white.withAlphaComponent(pAlpha).cgColor)
-                ctx.fillEllipse(in: CGRect(x: x, y: y, width: pSize, height: pSize))
+
+                // 边界平滑淡入淡出（在顶部与底部 8% 区域自然渐变消失）
+                let edgeFade = CGFloat(min(1.0, min(py / 0.08, (1.0 - py) / 0.08)))
+                guard edgeFade > 0.01 else { continue }
+
+                // 文字视线核心区（画幅中央 0.28 ~ 0.72）轻微淡化 18%，保证文字绝对清晰
+                let centerDist = abs(py - 0.5) / 0.5 // 0(中心) ~ 1(边缘)
+                let textZoneDamp = CGFloat(0.82 + 0.18 * centerDist)
+
+                // 闪烁呼吸透明度
+                let twinkle = sin(time * (1.1 + Double(p % 5) * 0.35) + seedPhase * 6.28)
+                let finalFade = edgeFade * textZoneDamp
+
+                if p < 20 {
+                    // 【第 1 层：远景微星背景】0.9~1.3px * uiScale，精细星子，微弱闪烁
+                    let pSize = CGFloat(0.9 + Double(p % 3) * 0.2) * uiScale
+                    let pAlpha = CGFloat(max(0.03, 0.08 + 0.08 * twinkle)) * finalFade
+                    ctx.setFillColor(NSColor.white.withAlphaComponent(pAlpha).cgColor)
+                    ctx.fillEllipse(in: CGRect(x: x, y: y, width: pSize, height: pSize))
+                } else if p < 36 {
+                    // 【第 2 层：中景浮游星尘】1.5~2.1px * uiScale，带环境色温（冷星蓝/微暖/柔紫）
+                    let pSize = CGFloat(1.5 + Double(p % 3) * 0.3) * uiScale
+                    let pAlpha = CGFloat(max(0.05, 0.14 + 0.12 * twinkle)) * finalFade
+                    let dustColor: NSColor
+                    switch p % 3 {
+                    case 0:
+                        dustColor = NSColor(calibratedRed: 0.75, green: 0.88, blue: 1.0, alpha: pAlpha) // 冰晶冷蓝
+                    case 1:
+                        dustColor = NSColor(calibratedRed: 1.0, green: 0.94, blue: 0.82, alpha: pAlpha) // 晨曦暖金
+                    default:
+                        dustColor = NSColor(calibratedRed: 0.92, green: 0.85, blue: 1.0, alpha: pAlpha) // 幽兰柔紫
+                    }
+                    ctx.setFillColor(dustColor.cgColor)
+                    ctx.fillEllipse(in: CGRect(x: x, y: y, width: pSize, height: pSize))
+                } else {
+                    // 【第 3 层：近景微光光晕】2.2~2.9px * uiScale，带柔光光晕 (Soft Bloom)
+                    let coreSize = CGFloat(2.2 + Double(p % 3) * 0.35) * uiScale
+                    let glowSize = coreSize * 1.7
+                    let coreAlpha = CGFloat(max(0.08, 0.20 + 0.14 * twinkle)) * finalFade
+                    let glowAlpha = coreAlpha * 0.30
+
+                    // 外层微弱柔焦微光晕
+                    ctx.setFillColor(NSColor.white.withAlphaComponent(glowAlpha).cgColor)
+                    ctx.fillEllipse(in: CGRect(x: x - (glowSize - coreSize) / 2, y: y - (glowSize - coreSize) / 2, width: glowSize, height: glowSize))
+
+                    // 内层晶亮发光核
+                    ctx.setFillColor(NSColor.white.withAlphaComponent(coreAlpha).cgColor)
+                    ctx.fillEllipse(in: CGRect(x: x, y: y, width: coreSize, height: coreSize))
+                }
             }
         }
     }

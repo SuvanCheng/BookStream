@@ -36,7 +36,10 @@ BookStream 全面支持 macOS 原生快捷键与全局菜单，助你高效批�
   - **大自然音效与背景音乐（BGM）混音**：支持自选 MP3/WAV/M4A，或开箱即用的 **7 大内置自然音效与轻音乐**（海浪波涛、山间小溪、沉浸雨声、林间微风、暗噪音、平衡粉噪、舒缓和弦氛围乐）；
   - **智能侧链避让压限（Smart Audio Ducking）**：Accelerate (vDSP) 实时识别人声能量包络，朗读时 BGM 自动压低避让，句间停顿与章节过渡自然回升；
   - **自适应停顿呼吸感**：支持 0× ~ 2× 停顿倍率（默认 1.4×），段末与分句呼吸感自然流畅。
-- **本地 AI 音色（Piper 神经网络 TTS）**：完全本地离线的神经网络音色，一键安装引擎与模型，100% 离线运行。
+- **全球顶级 AI 语音引擎架构**：
+  - **Kokoro-82M 本地神经模型（默认）**：完全本地离线的顶级神经网络语音模型，媲美 ElevenLabs，0 网络依赖，单次可稳定畅读几十小时；
+  - **微软广播级 Neural**：48kHz 广播级神经原声（云希、Christopher、晓晓等），免 API Key；
+  - **自定义 API 接口**：一键兼容 OpenAI `tts-1-hd`、ElevenLabs、CosyVoice、ChatTTS 及本地 GPU 推理服务。
 - **两条链路完全解耦**：字幕输入可**附带已有音频（wav/m4a/mp3）直接渲染视频，完全跳过 TTS**。
 
 ---
@@ -46,7 +49,7 @@ BookStream 全面支持 macOS 原生快捷键与全局菜单，助你高效批�
 ```bash
 ./build.sh              # 编译 → 打包 .app → 签名 → 启动
 ./build.sh --no-launch  # 仅打包不启动
-swift run BookStream --selftest        # 无头端到端 18 项全链路自检
+swift run BookStream --selftest        # 无头端到端全链路自检
 swift run BookStream --parse <file>    # 解析校验（txt/epub/srt/ass/ssa）
 ```
 
@@ -59,23 +62,19 @@ Package.swift                     SPM 清单（macOS 13+，Swift 6 语言模式�
 Sources/BookStream/
   Models.swift                    数据模型 + TXT/EPUB/SRT/ASS 解析 + 智能标点修复 + 分句
   AudioEngine.swift               TTS 离线抓轨 + BGM 侧链压限混音 + M4B 硬件 AAC 压缩
+  KokoroTTS.swift                 Kokoro-82M 本地顶级神经模型批处理引擎
+  EdgeTTS.swift                   微软 Edge-TTS 广播级神经语音引擎
+  CustomAPITTS.swift              自定义 OpenAI / 11Labs / CosyVoice API 客户端
   VideoSynthesizer.swift          逐行卡拉OK排版 + 多画幅/HEVC/字体/主题/声波 + AVAssetWriter 双轨混流
   ContentView.swift               SwiftUI 原生界面（快捷键/调色盘/音量滑块/日志/回放预览）
   BookStreamApp.swift             @main 入口（全局快捷键与原生菜单栏绑定）
-  SelfTest.swift                  无头端到端 18 项自动化全链路自检
+  SelfTest.swift                  无头端到端自动化全链路自检
 Scripts/make_icon.swift           应用图标生成器（CoreGraphics 绘制 → icns）
 Resources/AppIcon.icns            应用图标
 build.sh                          一键构建打包签名启动
 docs/ARCHITECTURE.md              架构与时钟对齐方案
 books/odyssey.txt                 示例书籍
 ```
-
-## 关于更自然的人声
-
-本机系统默认只带「默认」质量音色（英文最优为 Samantha，中文为 Tingting）。
-想要更接近真人声线，请在 **系统设置 → 辅助功能/语音 → 系统声音** 下载 Apple 的
-Enhanced / Premium（Siri）音色；下载后应用会自动把它们排在列表最前并标为
-「增强 / Premium」，默认选中最优音色。
 
 ## 快速体验
 

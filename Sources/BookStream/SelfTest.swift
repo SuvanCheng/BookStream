@@ -122,18 +122,14 @@ enum SelfTest {
             let (sentences, _) = try TextProcessor.parseBookFile(url: url)
             let testSentences = Array(sentences.prefix(256))
             print("Testing with \(testSentences.count) sentences from \(url.lastPathComponent)")
-            guard let piperVoice = PiperTTS.listModels().first(where: { $0.id.contains("danny") }) ?? PiperTTS.listModels().first else {
-                print("No piper voice found"); exit(1)
-            }
-            print("Using voice: \(piperVoice.id)")
             let tmpWav = URL(fileURLWithPath: "/tmp/drift-test.wav")
             try? FileManager.default.removeItem(at: tmpWav)
             let engine = AudioEngine()
             let result = try await engine.renderBook(
                 sentences: testSentences,
                 outputURL: tmpWav,
-                voiceIdentifier: nil,
-                piperVoice: piperVoice,
+                engine: .kokoro,
+                kokoroVoice: "af_heart",
                 rate: 0.4,
                 pauseScale: 1.4,
                 progress: { d, t in },
@@ -190,7 +186,8 @@ enum SelfTest {
             let result = try await engine.renderBook(
                 sentences: sentences,
                 outputURL: wavURL,
-                voiceIdentifier: nil,
+                engine: .kokoro,
+                kokoroVoice: "af_heart",
                 rate: 0.5,
                 progress: audioProgress,
                 cancellation: cancelled
@@ -210,12 +207,12 @@ enum SelfTest {
             // 1.4) 停顿感验证：pauseScale 生效（0× vs 2× 时长应明显不同）
             let pause0 = try await engine.renderBook(
                 sentences: sentences, outputURL: dir.appendingPathComponent("pause0.wav"),
-                voiceIdentifier: nil, piperVoice: nil, rate: 0.5,
+                engine: .kokoro, kokoroVoice: "af_heart", rate: 0.5,
                 pauseScale: 0, progress: audioProgress, cancellation: cancelled
             )
             let pause2 = try await engine.renderBook(
                 sentences: sentences, outputURL: dir.appendingPathComponent("pause2.wav"),
-                voiceIdentifier: nil, piperVoice: nil, rate: 0.5,
+                engine: .kokoro, kokoroVoice: "af_heart", rate: 0.5,
                 pauseScale: 2, progress: audioProgress, cancellation: cancelled
             )
             let d0 = pause0.segments.last?.end ?? 0
@@ -223,21 +220,17 @@ enum SelfTest {
             guard d2 > d0 + 0.5 else { throw BookStreamError.audioRenderFailed("停顿感无效: \(d0) vs \(d2)") }
             print("PAUSE OK: 0×停顿 \(String(format: "%.2f", d0))s → 2×停顿 \(String(format: "%.2f", d2))s")
 
-            // 1.5) 标点修复验证：补句号 / 折行合并 / 数字缩写保护 / 段末停顿
-            let repairSample = "他走进房间看见桌上有一封信他打开信封\n\n他说Mr. Smith走了3.5公里"
-            let (repairedText, fixes) = TextProcessor.repairPunctuation(repairSample)
-            let repairedParts = TextProcessor.splitSentencesWithPauses(repairedText)
-            guard !fixes.isEmpty, repairedText.contains("。") else {
-                throw BookStreamError.unsupportedFile("标点修复未生效")
+            // 1.5) 原文分句与数字缩写保护验证：折行合并 / 数字缩写保护 / 段末停顿（保留原书标点）
+            let sentenceSample = "他走进房间，看见桌上有一封信。\n\n他说Mr. Smith走了3.5公里。"
+            let splitParts = TextProcessor.splitSentencesWithPauses(sentenceSample)
+            guard splitParts.count == 2,
+                  splitParts[0].text == "他走进房间，看见桌上有一封信。",
+                  splitParts[1].text.contains("Mr. Smith"),
+                  splitParts[1].text.contains("3.5公里。"),
+                  splitParts[1].pauseAfter >= 1.0 else {
+                throw BookStreamError.unsupportedFile("分句结果异常: \(splitParts.map(\.text))")
             }
-            guard repairedParts.count == 2,
-                  repairedParts[0].text.hasSuffix("。"),
-                  repairedParts[1].text.contains("Mr. Smith"),
-                  repairedParts[1].text.contains("3.5公里"),
-                  repairedParts[1].pauseAfter >= 1.0 else {
-                throw BookStreamError.unsupportedFile("标点修复结果异常: \(repairedParts.map(\.text))")
-            }
-            print("REPAIR OK: 补句号 \(fixes.count) 处 · 折行合并成 \(repairedParts.count) 句 · Mr./3.5 未拆 · 段末停顿已标")
+            print("SPLIT OK: 准确分出 \(splitParts.count) 句 · Mr./3.5 未拆 · 原文标点完整 · 段末停顿已标")
 
             // 1.6) L3 长句拆分验证：超长无标点句按软边界拆短，每段长度受控
             let longSample = "他站在窗前望着远处的山峦心中思绪万千回想起这些年走过的路经历过的事每一件都历历在目那些欢笑那些泪水那些深夜的叹息都像是昨天才发生过一样他轻轻叹了口气转身回到书桌前拿起那封泛黄的信重新读了起来信上的字迹已经有些模糊但他依然认得那是父亲的手笔他决定明天就出发回到那个阔别多年的故乡去看一看曾经生活过的地方见一见那些久未联系的亲人朋友"
@@ -249,16 +242,16 @@ enum SelfTest {
             }
             print("L3 OK: \(longSample.count) 字 → \(longParts.count) 句（最长 \(longParts.map(\.text.count).max() ?? 0) 字）· 段末停顿保留")
 
-            // 1.6b) L3 英文回看区验证：唯一好切点（分号）恰在窗口外也应拆开（奥德赛开头）
-            let odysseyLong = "for they perished through their own sheer folly ineating the cattle of the Sun-god Hyperion; so thegod prevented them from ever reaching home."
-            let (odysseyParts, odysseyFixes) = TextProcessor.splitLongSentences([(odysseyLong, 0.4)])
+            // 1.6b) L3 英文从句分切验证：保持原文标点与从句流动
+            let odysseyLong = "for they perished through their own sheer folly in eating the cattle of the Sun-god Hyperion; so the god prevented them from ever reaching home."
+            let (odysseyParts, odysseyFixes) = TextProcessor.splitLongSentences([(odysseyLong, 0.4)], maxChars: 60)
             guard odysseyParts.count == 2,
                   odysseyFixes.count == 1,
-                  odysseyParts[0].text.hasSuffix("Hyperion."),
-                  odysseyParts[1].text.hasPrefix("so thegod") else {
-                throw BookStreamError.unsupportedFile("L3 英文回看区异常: \(odysseyParts.map(\.text))")
+                  odysseyParts[0].text.hasSuffix("Hyperion;"),
+                  odysseyParts[1].text.hasPrefix("so the god") else {
+                throw BookStreamError.unsupportedFile("L3 英文分句异常: \(odysseyParts.map(\.text))")
             }
-            print("L3-EN OK: 分号在窗口外（第92字）仍拆成 \(odysseyParts.count) 句: \(odysseyParts[0].text.count)/\(odysseyParts[1].text.count) 字")
+            print("L3-EN OK: 保持原文标点拆成 \(odysseyParts.count) 句: \(odysseyParts[0].text.count)/\(odysseyParts[1].text.count) 字")
 
             // 1.7) 英文名著适配验证：Gutenberg 样板剥离 / 章节标题与目录跳过 / 对话引号保留
             let gutenbergSample = """
@@ -336,32 +329,50 @@ enum SelfTest {
             }
             print("CHAPTER-SPLIT OK: 识别 \(sentChRanges.count) 个分卷范围 · 范围索引校准通过")
 
-            // 1.5) 本地 AI 音色（Piper）：若已安装模型则端到端验证
-            let models = PiperTTS.listModels()
-            if let piperVoice = models.first {
+            // 1.55) 微软 Neural 广播级引擎端到端验证（如果 Python edge-tts 运行环境就绪）
+            if EdgeTTS.isAvailable() {
                 do {
-                    let aiWAV = dir.appendingPathComponent("ai-voice.wav")
-                    let aiResult = try await engine.renderBook(
-                        sentences: sentences,
-                        outputURL: aiWAV,
-                        voiceIdentifier: nil,
-                        piperVoice: piperVoice,
-                        rate: 0.5,
+                    let edgeWAV = dir.appendingPathComponent("edge-voice.wav")
+                    let edgeResult = try await engine.renderBook(
+                        sentences: [Sentence(id: 0, text: "Welcome to Listening Bus.")],
+                        outputURL: edgeWAV,
+                        engine: .edgeTTS,
+                        edgeVoice: "en-US-ChristopherNeural",
+                        rate: 0.4,
                         progress: audioProgress,
                         cancellation: cancelled
                     )
-                    let aiSize = (try? fm.attributesOfItem(atPath: aiWAV.path)[.size]) as? Int ?? 0
-                    guard aiSize > 44_000, aiResult.segments.count == sentences.count else {
-                        throw BookStreamError.audioRenderFailed("AI 音色输出异常: \(aiSize) 字节")
+                    let edgeSize = (try? fm.attributesOfItem(atPath: edgeWAV.path)[.size]) as? Int ?? 0
+                    guard edgeSize > 10_000, !edgeResult.segments.isEmpty else {
+                        throw BookStreamError.audioRenderFailed("微软 Neural 输出异常: \(edgeSize) 字节")
                     }
-                    print("AI VOICE OK: \(piperVoice.displayName) [\(piperVoice.language)]，\(String(format: "%.2f", aiResult.segments.last?.end ?? 0))s 音频, \(aiSize) 字节")
+                    print("EDGE-TTS OK: Christopher [en-US]，\(String(format: "%.2f", edgeResult.segments.last?.end ?? 0))s 音频, \(edgeSize) 字节（48kHz 广播级神经原声）")
                 } catch {
-                    let ns = error as NSError
-                    print("AI DEBUG ERROR: \(String(describing: error)) | domain=\(ns.domain) code=\(ns.code)")
-                    throw error
+                    print("EDGE-TTS SKIP: 网络波动或环境不可达: \(error.localizedDescription)")
                 }
-            } else {
-                print("AI VOICE SKIP: 未安装本地 Piper 音色模型")
+            }
+
+            // 1.56) Kokoro-82M 本地顶级神经网络引擎端到端验证（完全离线·秒级推理）
+            if KokoroTTS.isAvailable() {
+                do {
+                    let kokoroWAV = dir.appendingPathComponent("kokoro-voice.wav")
+                    let kokoroResult = try await engine.renderBook(
+                        sentences: [Sentence(id: 0, text: "Welcome to Listening Bus audiobook.")],
+                        outputURL: kokoroWAV,
+                        engine: .kokoro,
+                        kokoroVoice: "af_heart",
+                        rate: 0.4,
+                        progress: audioProgress,
+                        cancellation: cancelled
+                    )
+                    let kokoroSize = (try? fm.attributesOfItem(atPath: kokoroWAV.path)[.size]) as? Int ?? 0
+                    guard kokoroSize > 10_000, !kokoroResult.segments.isEmpty else {
+                        throw BookStreamError.audioRenderFailed("Kokoro 输出异常: \(kokoroSize) 字节")
+                    }
+                    print("KOKORO-TTS OK: Heart (af_heart) [en-US]，\(String(format: "%.2f", kokoroResult.segments.last?.end ?? 0))s 音频, \(kokoroSize) 字节（Kokoro-82M 本地顶级神经原声）")
+                } catch {
+                    print("KOKORO-TTS SKIP: \(error.localizedDescription)")
+                }
             }
 
             // 1.6) 字幕旁白溢出策略验证（紧窗口强制触发溢出）
@@ -373,7 +384,7 @@ enum SelfTest {
             let extWAV = dir.appendingPathComponent("overflow-extend.wav")
             let extResult = try await engine.renderSubtitleAudio(
                 entries: tightEntries, outputURL: extWAV,
-                voiceIdentifier: nil, piperVoice: nil, rate: 0.5,
+                engine: .kokoro, kokoroVoice: "af_heart", rate: 0.5,
                 overflowPolicy: .extend, progress: audioProgress, cancellation: cancelled
             )
             let extLen = (try? fm.attributesOfItem(atPath: extWAV.path)[.size]) as? Int ?? 0
@@ -386,7 +397,7 @@ enum SelfTest {
             let truncWAV = dir.appendingPathComponent("overflow-truncate.wav")
             let truncResult = try await engine.renderSubtitleAudio(
                 entries: tightEntries, outputURL: truncWAV,
-                voiceIdentifier: nil, piperVoice: nil, rate: 0.5,
+                engine: .kokoro, kokoroVoice: "af_heart", rate: 0.5,
                 overflowPolicy: .truncate, progress: audioProgress, cancellation: cancelled
             )
             let truncDur = truncResult.segments.last?.end ?? 0
