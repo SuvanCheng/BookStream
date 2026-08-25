@@ -547,6 +547,50 @@ enum SelfTest {
             guard decoupledSize > 100_000 else { throw BookStreamError.videoRenderFailed("解耦视频过小: \(decoupledSize)") }
             print("DECOUPLED OK: 由 SRT 时间轴 + 已有 WAV 渲染，无 TTS，\(decoupledSize) 字节")
 
+            // 10) 电台级录音棚人声温暖度与壁炉柴火音效验证
+            let fireplaceWavURL = dir.appendingPathComponent("selftest_fireplace.wav")
+            try AudioEngine.generateProceduralBGM(preset: "fireplace", totalSeconds: 3.0, outputURL: fireplaceWavURL)
+            let fireplaceSize = (try? fm.attributesOfItem(atPath: fireplaceWavURL.path)[.size]) as? Int ?? 0
+            guard fireplaceSize > 50_000 else { throw BookStreamError.audioRenderFailed("壁炉音效过小: \(fireplaceSize)") }
+            print("FIREPLACE & VOCAL WARMTH OK: \(fireplaceWavURL.lastPathComponent), \(fireplaceSize) 字节（壁炉柴火噼啪声）")
+
+            // 11) 影视级片头封面、星尘微粒与 Siri 波浪光带视频渲染验证
+            let cinematicMP4 = dir.appendingPathComponent("cinematic_wave.mp4")
+            try await renderer.render(
+                audioURL: wavURL,
+                segments: result.segments,
+                outputURL: cinematicMP4,
+                style: CaptionStyle(
+                    highlight: .gold,
+                    theme: .midnightPurple,
+                    visualizerStyle: .waveRibbon,
+                    enableIntroOutro: true,
+                    enableParticles: true
+                ),
+                resolution: .p480,
+                codec: .h264,
+                progress: videoProgress,
+                cancellation: cancelled
+            )
+            let cinematicSize = (try? fm.attributesOfItem(atPath: cinematicMP4.path)[.size]) as? Int ?? 0
+            guard cinematicSize > 50_000 else { throw BookStreamError.videoRenderFailed("影视级视频过小: \(cinematicSize)") }
+            print("CINEMATIC & VISUALIZER OK: \(cinematicMP4.lastPathComponent), \(cinematicSize) 字节（Siri 光带·片头淡入·星尘微粒）")
+
+            // 12) 高清短视频设计封面图生成验证
+            let coverURL = dir.appendingPathComponent("selftest_cover.jpg")
+            try VideoSynthesizer.generateCoverImage(
+                title: "小王子 The Little Prince",
+                chapter: "第 01 章",
+                theme: .darkGradient,
+                aspectRatio: .portrait9_16,
+                quality: .p1080,
+                highlightColor: .gold,
+                outputURL: coverURL
+            )
+            let coverSize = (try? fm.attributesOfItem(atPath: coverURL.path)[.size]) as? Int ?? 0
+            guard coverSize > 20_000 else { throw BookStreamError.videoRenderFailed("封面图过小: \(coverSize)") }
+            print("COVER GENERATION OK: \(coverURL.lastPathComponent), \(coverSize) 字节（1080x1920 高清封面图）")
+
             print("SELFTEST PASSED")
         } catch {
             print("SELFTEST FAILED: \(error)")

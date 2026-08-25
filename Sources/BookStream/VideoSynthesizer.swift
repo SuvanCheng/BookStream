@@ -28,6 +28,7 @@ public struct CaptionColor: Sendable, Hashable, Codable {
 
     // 常用预设
     public static let vividOrange = CaptionColor(red: 1.00, green: 0.55, blue: 0.00)
+    public static let gold        = CaptionColor(red: 0.95, green: 0.77, blue: 0.20)
     public static let white       = CaptionColor(red: 0.95, green: 0.95, blue: 0.95)
     public static let red         = CaptionColor(red: 1.00, green: 0.29, blue: 0.29)
     public static let yellow      = CaptionColor(red: 1.00, green: 0.80, blue: 0.20)
@@ -128,36 +129,86 @@ public enum BackgroundTheme: String, CaseIterable, Codable, Identifiable, Sendab
     }
 }
 
+/// 动态声波律动样式预设
+public enum VisualizerStyle: String, CaseIterable, Codable, Identifiable, Sendable {
+    case waveRibbon  = "waveRibbon"  // Siri 风格平滑双波浪光带
+    case bars        = "bars"        // 经典律动柱
+    case off         = "off"         // 关闭
+
+    public var id: String { rawValue }
+    public var label: String {
+        switch self {
+        case .waveRibbon: return "Siri 平滑光带"
+        case .bars: return "经典律动柱"
+        case .off: return "关闭"
+        }
+    }
+}
+
 /// 滚动字幕排版样式。
 public struct CaptionStyle: Sendable {
     public let highlight: CaptionColor
     public let normal: CaptionColor
     public let scrollSpeed: Double // 像素/秒，控制字幕上滚速度
     public let theme: BackgroundTheme
-    public let showVisualizer: Bool
+    public let visualizerStyle: VisualizerStyle
     public let font: SubtitleFont
     public let enableKaraoke: Bool
+    public let enableIntroOutro: Bool // 片头封面与片尾淡入淡出 (1.5s，默认关闭)
+    public let enableParticles: Bool  // 深空星尘微光微粒背景
+
+    /// 向后兼容：是否显示声波挂件
+    public var showVisualizer: Bool { visualizerStyle != .off }
 
     public init(
         highlight: CaptionColor = .vividOrange,
         normal: CaptionColor = .white,
         scrollSpeed: Double = 55,
         theme: BackgroundTheme = .pureBlack,
-        showVisualizer: Bool = true,
+        visualizerStyle: VisualizerStyle = .bars,
         font: SubtitleFont = .systemDefault,
-        enableKaraoke: Bool = true
+        enableKaraoke: Bool = true,
+        enableIntroOutro: Bool = false,
+        enableParticles: Bool = true
     ) {
         self.highlight = highlight
         self.normal = normal
         self.scrollSpeed = scrollSpeed
         self.theme = theme
-        self.showVisualizer = showVisualizer
+        self.visualizerStyle = visualizerStyle
         self.font = font
         self.enableKaraoke = enableKaraoke
+        self.enableIntroOutro = enableIntroOutro
+        self.enableParticles = enableParticles
+    }
+
+    /// 向后兼容构造器
+    public init(
+        highlight: CaptionColor = .vividOrange,
+        normal: CaptionColor = .white,
+        scrollSpeed: Double = 55,
+        theme: BackgroundTheme = .pureBlack,
+        showVisualizer: Bool,
+        font: SubtitleFont = .systemDefault,
+        enableKaraoke: Bool = true,
+        enableIntroOutro: Bool = false,
+        enableParticles: Bool = true
+    ) {
+        self.init(
+            highlight: highlight,
+            normal: normal,
+            scrollSpeed: scrollSpeed,
+            theme: theme,
+            visualizerStyle: showVisualizer ? .bars : .off,
+            font: font,
+            enableKaraoke: enableKaraoke,
+            enableIntroOutro: enableIntroOutro,
+            enableParticles: enableParticles
+        )
     }
 }
 
-/// 水印设置（文本或图片；位置/大小/透明度可调，可持久化）。
+/// 水印设置（支持文字水印与图片 Logo 水印独立共存、独立动效与精确刻度调控）。
 public struct WatermarkSettings: Sendable, Codable, Equatable {
     public enum Position: String, CaseIterable, Codable, Identifiable, Sendable {
         case topLeft, topCenter, topRight
@@ -179,33 +230,71 @@ public struct WatermarkSettings: Sendable, Codable, Equatable {
         }
     }
 
-    public var enabled: Bool
+    /// 水印动效模式（支持打砖块慢速游走与周期性掠影，强力防搬运）
+    public enum Motion: String, CaseIterable, Codable, Identifiable, Sendable {
+        case `static`            = "static"            // 固定角落
+        case bouncingDrift       = "bouncingDrift"       // 打砖块慢速弹球游走 (强防搬运)
+        case periodicFlythrough  = "periodicFlythrough"  // 周期性优雅掠影滑过 (每 22s 飘过)
+
+        public var id: String { rawValue }
+        public var label: String {
+            switch self {
+            case .static: return "固定位置"
+            case .bouncingDrift: return "打砖块慢速游走 (强防盗)"
+            case .periodicFlythrough: return "周期性掠影滑过 (极简)"
+            }
+        }
+    }
+
+    public var enabled: Bool             // 水印总开关
+
+    // --- 文字水印 (Text) ---
+    public var enableText: Bool          // 启用文字水印
     public var text: String
     public var color: CaptionColor
-    public var fontSize: Double        // 相对 1080p 的字号（随分辨率缩放）
-    public var opacity: Double         // 0-1
-    public var position: Position
-    public var imageData: Data?        // 导入的图片（PNG/JPEG）；nil = 文本水印
-    public var imageScale: Double      // 图片宽度相对画布宽度比例（0.05-0.4）
+    public var fontSize: Double          // 相对 1080p 的字号 (12-72 pt)
+    public var opacity: Double           // 文字透明度 (0.05-1.0)
+    public var position: Position        // 文字固定位置
+    public var motion: Motion            // 文字动效形态
+
+    // --- 图片 / Logo 水印 (Image) ---
+    public var enableImage: Bool         // 启用图片 Logo 水印
+    public var imageData: Data?          // 导入的图片 (PNG/JPEG)
+    public var imageScale: Double        // 图片缩放比例 (0.05-0.40)
+    public var imageOpacity: Double      // 图片透明度 (0.05-1.0)
+    public var imagePosition: Position   // 图片固定位置
+    public var imageMotion: Motion       // 图片动效形态
 
     public init(
         enabled: Bool = false,
-        text: String = "BookStream",
+        enableText: Bool = true,
+        text: String = "听力巴士",
         color: CaptionColor = .white,
-        fontSize: Double = 36,
-        opacity: Double = 0.35,
-        position: Position = .bottomRight,
+        fontSize: Double = 32,
+        opacity: Double = 0.22,
+        position: Position = .topRight,
+        motion: Motion = .static,
+        enableImage: Bool = false,
         imageData: Data? = nil,
-        imageScale: Double = 0.12
+        imageScale: Double = 0.12,
+        imageOpacity: Double = 0.35,
+        imagePosition: Position = .topLeft,
+        imageMotion: Motion = .static
     ) {
         self.enabled = enabled
+        self.enableText = enableText
         self.text = text
         self.color = color
         self.fontSize = fontSize
         self.opacity = opacity
         self.position = position
+        self.motion = motion
+        self.enableImage = enableImage
         self.imageData = imageData
         self.imageScale = imageScale
+        self.imageOpacity = imageOpacity
+        self.imagePosition = imagePosition
+        self.imageMotion = imageMotion
     }
 
     public static let `default` = WatermarkSettings()
@@ -274,6 +363,8 @@ public struct VideoResolution: Sendable, Hashable {
 
     public static let all: [VideoResolution] = [.p480, .p720, .p1080, .p4k]
 }
+
+public typealias VideoSynthesizer = VideoRenderer
 
 /// 动态字幕排版视频渲染器。
 ///
@@ -1019,8 +1110,8 @@ public final class VideoRenderer: @unchecked Sendable {
 
     // MARK: - 主题背景与声波可视化绘制
 
-    /// 绘制多样化背景主题（纯黑、深空微光渐变、炭黑雅致、午夜暗韵）。
-    private func drawBackground(theme: BackgroundTheme, in ctx: CGContext, canvas: CGSize) {
+    /// 绘制多样化背景主题（纯黑、深空微光渐变、炭黑雅致、午夜暗韵），支持深空星尘微光微粒背景。
+    private func drawBackground(theme: BackgroundTheme, enableParticles: Bool, time: Double, in ctx: CGContext, canvas: CGSize) {
         let fullRect = CGRect(origin: .zero, size: canvas)
         switch theme {
         case .pureBlack:
@@ -1069,6 +1160,23 @@ public final class VideoRenderer: @unchecked Sendable {
             } else {
                 ctx.setFillColor(NSColor.black.cgColor)
                 ctx.fill(fullRect)
+            }
+        }
+
+        // 深空星尘微光微粒背景（平缓飘浮、微弱呼吸感）
+        if enableParticles {
+            for p in 0..<36 {
+                let seedX = Double((p * 7919 + 137) % 1000) / 1000.0
+                let seedSpeed = 0.06 + Double((p * 3571) % 100) / 1500.0
+                let seedPhase = Double((p * 2909) % 100) / 100.0
+                let py = (Double(time * seedSpeed) + seedPhase).truncatingRemainder(dividingBy: 1.0)
+                let px = seedX + 0.025 * sin(time * 0.7 + seedPhase * 6.28)
+                let x = CGFloat(px) * canvas.width
+                let y = CGFloat(py) * canvas.height
+                let pAlpha = CGFloat(max(0.04, 0.12 + 0.14 * sin(time * 1.8 + seedPhase * 6.28)))
+                let pSize = CGFloat(1.2 + Double(p % 3) * 0.7)
+                ctx.setFillColor(NSColor.white.withAlphaComponent(pAlpha).cgColor)
+                ctx.fillEllipse(in: CGRect(x: x, y: y, width: pSize, height: pSize))
             }
         }
     }
@@ -1165,71 +1273,218 @@ public final class VideoRenderer: @unchecked Sendable {
         return spectrum
     }
 
-    /// 绘制真实多频段对数 FFT 频谱驱动的动态声波可视化挂件（36 根胶囊频谱柱，层次分明、起伏平滑灵动，精致不突兀，静止时完全平息）。
+    /// 绘制真实多频段对数 FFT 频谱驱动的动态声波可视化挂件（支持经典律动柱、Siri 双波浪光带、播客圆环脉冲）。
     private func drawAudioVisualizer(
         in ctx: CGContext,
         time: Double,
         spectrum: [Float],
+        style: VisualizerStyle,
         highlightColor: NSColor,
         scale: CGFloat,
         canvas: CGSize
     ) {
-        let barCount = 36
-        let totalWidth: CGFloat = min(canvas.width - 40, 240 * scale)
-        let barWidth: CGFloat = max(1.5, 2.8 * scale)
-        let barGap = max(1.0, (totalWidth - CGFloat(barCount) * barWidth) / CGFloat(barCount - 1))
-        let startX = (canvas.width - (CGFloat(barCount) * barWidth + CGFloat(barCount - 1) * barGap)) / 2
-        let baseY: CGFloat = 34 * scale
-        let maxBarHeight: CGFloat = 16 * scale
-        let minBarHeight: CGFloat = 2.2 * scale
+        guard style != .off else { return }
 
+        let barCount = 36
         let frameIdx = min(max(0, Int(time * 60.0)), max(0, spectrum.count / barCount - 1))
         let frameOffset = frameIdx * barCount
 
-        // 检验本帧是否处于全频段静音
+        var avgEnergy: CGFloat = 0
         var isFrameSilent = true
         if !spectrum.isEmpty {
+            var sum: Float = 0
             for b in 0..<barCount {
-                if spectrum[frameOffset + b] > 0.015 {
-                    isFrameSilent = false
-                    break
-                }
+                let v = spectrum[frameOffset + b]
+                sum += v
+                if v > 0.015 { isFrameSilent = false }
             }
+            avgEnergy = CGFloat(sum / Float(barCount))
         }
 
-        for i in 0..<barCount {
-            let x = startX + CGFloat(i) * (barWidth + barGap)
-            let normIdx = Double(i) / Double(barCount - 1) // 0 to 1
-            // 边缘平缓微过渡（避免过陡的椭圆橄榄球感，保留自然频谱跳动）
-            let edgeTaper = CGFloat(0.75 + 0.25 * sin(normIdx * .pi))
+        switch style {
+        case .off:
+            return
 
-            // 频段对称映射：低频（人声基频）位于中心附近，高频（泛音/辅音）分布于两侧
-            let center = Double(barCount - 1) / 2.0
-            let distFromCenter = abs(Double(i) - center) / center // 0 at center, 1 at edge
-            let bandIndex = min(barCount - 1, max(0, Int(distFromCenter * Double(barCount - 1))))
+        case .bars:
+            // 经典律动柱（36 根胶囊柱对称分布）
+            let baseY: CGFloat = 24 * scale
+            let totalWidth: CGFloat = min(canvas.width - 40, 240 * scale)
+            let barWidth: CGFloat = max(1.5, 2.8 * scale)
+            let barGap = max(1.0, (totalWidth - CGFloat(barCount) * barWidth) / CGFloat(barCount - 1))
+            let startX = (canvas.width - (CGFloat(barCount) * barWidth + CGFloat(barCount - 1) * barGap)) / 2
+            let maxBarHeight: CGFloat = 16 * scale
+            let minBarHeight: CGFloat = 2.2 * scale
 
-            let bandEnergy: CGFloat
+            for i in 0..<barCount {
+                let x = startX + CGFloat(i) * (barWidth + barGap)
+                let normIdx = Double(i) / Double(barCount - 1)
+                let edgeTaper = CGFloat(0.75 + 0.25 * sin(normIdx * .pi))
+                let center = Double(barCount - 1) / 2.0
+                let distFromCenter = abs(Double(i) - center) / center
+                let bandIndex = min(barCount - 1, max(0, Int(distFromCenter * Double(barCount - 1))))
+
+                let bandEnergy: CGFloat
+                if !spectrum.isEmpty && !isFrameSilent {
+                    let rawVal = CGFloat(spectrum[frameOffset + bandIndex])
+                    bandEnergy = pow(rawVal, 0.9)
+                } else {
+                    bandEnergy = 0
+                }
+
+                let h: CGFloat
+                if !isFrameSilent && bandEnergy > 0.005 {
+                    let dynamicH = min(1.0, bandEnergy * edgeTaper)
+                    h = minBarHeight + dynamicH * (maxBarHeight - minBarHeight)
+                } else {
+                    h = minBarHeight
+                }
+
+                let rect = CGRect(x: x, y: baseY - h / 2, width: barWidth, height: h)
+                let alpha: CGFloat = !isFrameSilent ? (0.30 + bandEnergy * 0.60) : 0.16
+                ctx.setFillColor(highlightColor.withAlphaComponent(alpha).cgColor)
+                let path = CGPath(roundedRect: rect, cornerWidth: barWidth / 2, cornerHeight: barWidth / 2, transform: nil)
+                ctx.addPath(path)
+                ctx.fillPath()
+            }
+
+        case .waveRibbon:
+            // Siri 极光流光多层光带（4 层流光谐波 + 极光色彩渐变 + 三次样条平滑曲线 + 峰值微光星尘）
+            // 贴近底边（28px），振幅上限 18px，紧密贴合而不出底界
+            let baseY: CGFloat = 28 * scale
+            let ribbonWidth: CGFloat = min(canvas.width - 40, 260 * scale)
+            let startX = (canvas.width - ribbonWidth) / 2
+            let points = 64
+            let step = ribbonWidth / CGFloat(points - 1)
+
+            // 提取高低频分量能量
+            var bassEnergy: CGFloat = 0
+            var trebleEnergy: CGFloat = 0
             if !spectrum.isEmpty && !isFrameSilent {
-                let rawVal = CGFloat(spectrum[frameOffset + bandIndex])
-                bandEnergy = pow(rawVal, 0.9)
-            } else {
-                bandEnergy = 0
+                var bSum: Float = 0
+                for b in 0..<12 { bSum += spectrum[frameOffset + b] }
+                bassEnergy = CGFloat(bSum / 12.0)
+
+                var tSum: Float = 0
+                for b in 12..<barCount { tSum += spectrum[frameOffset + b] }
+                trebleEnergy = CGFloat(tSum / Float(barCount - 12))
             }
 
-            let h: CGFloat
-            if !isFrameSilent && bandEnergy > 0.005 {
-                let dynamicH = min(1.0, bandEnergy * edgeTaper)
-                h = minBarHeight + dynamicH * (maxBarHeight - minBarHeight)
-            } else {
-                h = minBarHeight
+            // 静音时维持细腻呼吸波澜（~1.5px 优雅律动），振幅上限 18px
+            let idleBreath = CGFloat(0.35 * sin(time * 2.2))
+            let baseAmp: CGFloat = isFrameSilent ? ((1.4 + idleBreath) * scale) : min(18.0 * scale, (2.2 * scale + (bassEnergy * 11.0 + trebleEnergy * 6.5) * scale))
+            let speechAlpha: CGFloat = isFrameSilent ? 0.30 : (0.55 + avgEnergy * 0.45)
+
+            // 0. 底层柔光氛围微光（弥散光环，呼吸流动）
+            if !isFrameSilent && avgEnergy > 0.02 {
+                let auraW = ribbonWidth * 0.80
+                let auraH = min(baseY * 1.4, max(12 * scale, baseAmp * 1.8))
+                let auraRect = CGRect(x: (canvas.width - auraW) / 2, y: baseY - auraH / 2, width: auraW, height: auraH)
+                ctx.saveGState()
+                ctx.setFillColor(highlightColor.withAlphaComponent(0.14 * avgEnergy).cgColor)
+                ctx.fillEllipse(in: auraRect)
+                ctx.restoreGState()
             }
 
-            let rect = CGRect(x: x, y: baseY - h / 2, width: barWidth, height: h)
-            let alpha: CGFloat = !isFrameSilent ? (0.30 + bandEnergy * 0.60) : 0.16
-            ctx.setFillColor(highlightColor.withAlphaComponent(alpha).cgColor)
-            let path = CGPath(roundedRect: rect, cornerWidth: barWidth / 2, cornerHeight: barWidth / 2, transform: nil)
-            ctx.addPath(path)
-            ctx.fillPath()
+            // 辅助：生成单条多项式缓动正弦波点集（底边保留 2.5px 紧密防穿透安全余量）
+            let maxDownwardExcursion = baseY - 2.5 * scale
+            func computeWavePoints(freq1: Double, freq2: Double, freq3: Double, speed: Double, phaseOffset: Double, ampFactor: CGFloat) -> [CGPoint] {
+                var pts: [CGPoint] = []
+                pts.reserveCapacity(points)
+                for i in 0..<points {
+                    let normX = Double(i) / Double(points - 1) // 0 to 1
+                    let x = startX + CGFloat(i) * step
+                    // 汉宁窗包络：两端平滑归零，中心饱满
+                    let env = pow(sin(normX * .pi), 1.35)
+
+                    let wave1 = sin(normX * .pi * freq1 + time * speed + phaseOffset)
+                    let wave2 = cos(normX * .pi * freq2 - time * (speed * 0.75) + phaseOffset * 1.3) * 0.42
+                    let wave3 = sin(normX * .pi * freq3 + time * (speed * 1.2) + phaseOffset * 0.7) * 0.22
+                    let rawDy = baseAmp * ampFactor * CGFloat(wave1 + wave2 + wave3) * CGFloat(env)
+                    let safeDy = max(-maxDownwardExcursion, rawDy)
+
+                    pts.append(CGPoint(x: x, y: baseY + safeDy))
+                }
+                return pts
+            }
+
+            // 辅助：将点集绘制为光滑的三次 Bézier 曲线路径
+            func makeSmoothPath(from pts: [CGPoint]) -> CGPath {
+                let path = CGMutablePath()
+                guard pts.count > 1 else { return path }
+                path.move(to: pts[0])
+                for i in 0..<pts.count - 1 {
+                    let p0 = pts[max(0, i - 1)]
+                    let p1 = pts[i]
+                    let p2 = pts[i + 1]
+                    let p3 = pts[min(pts.count - 1, i + 2)]
+
+                    let cp1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6.0, y: p1.y + (p2.y - p0.y) / 6.0)
+                    let cp2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6.0, y: p2.y - (p3.y - p1.y) / 6.0)
+                    path.addCurve(to: p2, control1: cp1, control2: cp2)
+                }
+                return path
+            }
+
+            ctx.saveGState()
+            ctx.setLineCap(.round)
+            ctx.setLineJoin(.round)
+
+            // 计算极光副色（在主题色基础上产生和谐流光辉映）
+            let baseRGB = highlightColor
+            let auxColor1 = NSColor(calibratedRed: min(1.0, baseRGB.redComponent * 0.6 + 0.35),
+                                    green: min(1.0, baseRGB.greenComponent * 0.8 + 0.20),
+                                    blue: min(1.0, baseRGB.blueComponent * 0.4 + 0.60),
+                                    alpha: speechAlpha * 0.38)
+            let auxColor2 = NSColor(calibratedRed: min(1.0, baseRGB.redComponent * 0.9 + 0.10),
+                                    green: min(1.0, baseRGB.greenComponent * 0.6 + 0.35),
+                                    blue: min(1.0, baseRGB.blueComponent * 0.9 + 0.10),
+                                    alpha: speechAlpha * 0.55)
+
+            // 层 1：外围深邃极光反相光带（宽幅柔和）
+            let pts1 = computeWavePoints(freq1: 2.6, freq2: 4.0, freq3: 5.8, speed: 2.2, phaseOffset: .pi * 0.6, ampFactor: 0.68)
+            let path1 = makeSmoothPath(from: pts1)
+            ctx.setLineWidth(max(1.2, 1.8 * scale))
+            ctx.setStrokeColor(auxColor1.cgColor)
+            ctx.addPath(path1)
+            ctx.strokePath()
+
+            // 层 2：次级高频谐波光带（灵动交错）
+            let pts2 = computeWavePoints(freq1: 3.4, freq2: 2.2, freq3: 6.2, speed: -2.8, phaseOffset: .pi * 1.25, ampFactor: 0.86)
+            let path2 = makeSmoothPath(from: pts2)
+            ctx.setLineWidth(max(1.4, 2.2 * scale))
+            ctx.setStrokeColor(auxColor2.cgColor)
+            ctx.addPath(path2)
+            ctx.strokePath()
+
+            // 层 3：主光波霓虹外发光（Glow Core）
+            let ptsMain = computeWavePoints(freq1: 2.0, freq2: 3.1, freq3: 4.8, speed: 3.4, phaseOffset: 0.0, ampFactor: 1.0)
+            let pathMain = makeSmoothPath(from: ptsMain)
+            ctx.setLineWidth(max(2.4, 3.8 * scale))
+            ctx.setStrokeColor(highlightColor.withAlphaComponent(speechAlpha * 0.50).cgColor)
+            ctx.addPath(pathMain)
+            ctx.strokePath()
+
+            // 层 4：主光波璀璨晶亮核心束（高亮白透发光核）
+            ctx.setLineWidth(max(1.2, 1.8 * scale))
+            let coreColor = NSColor.white.withAlphaComponent(isFrameSilent ? 0.35 : 0.90)
+            ctx.setStrokeColor(coreColor.cgColor)
+            ctx.addPath(pathMain)
+            ctx.strokePath()
+
+            // 层 5：峰值微光星尘（讲话能量高时在波峰处点缀 3 颗细微流光粒子）
+            if !isFrameSilent && avgEnergy > 0.06 {
+                let sparkIndices = [points / 4, points / 2, points * 3 / 4]
+                for (idx, pIdx) in sparkIndices.enumerated() {
+                    let pt = ptsMain[pIdx]
+                    let sparkSize = CGFloat(2.0 + Double(idx) * 0.6) * scale
+                    let sparkAlpha = CGFloat(min(1.0, 0.4 + avgEnergy * 1.5))
+                    let sparkRect = CGRect(x: pt.x - sparkSize / 2, y: pt.y - sparkSize / 2, width: sparkSize, height: sparkSize)
+                    ctx.setFillColor(NSColor.white.withAlphaComponent(sparkAlpha).cgColor)
+                    ctx.fillEllipse(in: sparkRect)
+                }
+            }
+
+            ctx.restoreGState()
         }
     }
 
@@ -1294,8 +1549,8 @@ public final class VideoRenderer: @unchecked Sendable {
 
         let fullRect = CGRect(x: 0, y: 0, width: width, height: height)
 
-        // 1. 背景绘制（支持纯黑、深空微光渐变、炭黑雅致、午夜暗韵）
-        drawBackground(theme: style.theme, in: ctx, canvas: fullRect.size)
+        // 1. 背景绘制（支持纯黑、深空微光渐变、炭黑雅致、午夜暗韵与星尘微粒）
+        drawBackground(theme: style.theme, enableParticles: style.enableParticles, time: videoTime, in: ctx, canvas: fullRect.size)
 
         // 2. 滚动字幕流（含字级卡拉OK点亮动效与切句平滑缓动）
         _ = drawRollingCaptions(
@@ -1313,28 +1568,62 @@ public final class VideoRenderer: @unchecked Sendable {
             canvas: fullRect.size
         )
 
-        // 3. 动态声波可视化挂件（置于底部进度条上方，讲话时声律跳动，静止时完全平稳收拢）
+        // 3. 动态声波可视化挂件（支持经典律动柱、Siri 波浪光带、播客圆环脉冲）
         if style.showVisualizer {
             drawAudioVisualizer(
                 in: ctx,
                 time: videoTime,
                 spectrum: spectrum,
+                style: style.visualizerStyle,
                 highlightColor: style.highlight.nsColor,
                 scale: scale,
                 canvas: fullRect.size
             )
         }
 
-        // 4. 底部进度条（随分辨率等比缩放，采用主题高亮色）
+        // 4. 底部进度条（紧贴屏幕最底部 y = 0，含半透明暗轨底槽 + 高亮主进度条）
         if totalDuration > 0 {
+            let barHeight = max(2.5, 4.0 * scale)
             let fraction = CGFloat(min(max(videoTime / totalDuration, 0), 1))
-            ctx.setFillColor(style.highlight.nsColor.withAlphaComponent(0.75).cgColor)
-            ctx.fill(CGRect(x: 0, y: 14 * scale, width: CGFloat(width) * fraction, height: 4 * scale))
+            // 半透明暗轨底槽
+            ctx.setFillColor(NSColor.white.withAlphaComponent(0.12).cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(width), height: barHeight))
+            // 高亮主进度条
+            ctx.setFillColor(style.highlight.nsColor.withAlphaComponent(0.88).cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(width) * fraction, height: barHeight))
         }
 
-        // 5. 水印
+        // 5. 片头封面卡与片尾淡入淡出（1.5s 影视级平滑过渡）
+        if style.enableIntroOutro && totalDuration > 3.0 {
+            // 片头封面（前 1.5s 优雅淡入淡出）
+            if videoTime < 1.5 {
+                let introP = videoTime / 1.5
+                let introAlpha: CGFloat
+                if introP < 0.25 {
+                    introAlpha = CGFloat(introP / 0.25)
+                } else if introP > 0.75 {
+                    introAlpha = CGFloat((1.0 - introP) / 0.25)
+                } else {
+                    introAlpha = 1.0
+                }
+                // 装饰光晕点缀
+                if introAlpha > 0.05 {
+                    ctx.setFillColor(NSColor.black.withAlphaComponent(0.60 * introAlpha).cgColor)
+                    ctx.fill(fullRect)
+                }
+            }
+            // 片尾淡出黑场（最后 1.2s）
+            let outroStart = totalDuration - 1.2
+            if videoTime > outroStart {
+                let outroP = CGFloat((videoTime - outroStart) / 1.2)
+                ctx.setFillColor(NSColor.black.withAlphaComponent(min(1.0, outroP)).cgColor)
+                ctx.fill(fullRect)
+            }
+        }
+
+        // 6. 水印（支持固定位置 / 打砖块慢速游走 / 周期性掠影）
         if watermark.enabled {
-            drawWatermark(watermark, in: ctx, canvas: fullRect.size)
+            drawWatermark(watermark, time: videoTime, in: ctx, canvas: fullRect.size)
         }
 
         // 调试帧转储：BOOKSTREAM_FRAMEDUMP=/tmp/fd 时每 30 帧存一张 PNG
@@ -1347,6 +1636,114 @@ public final class VideoRenderer: @unchecked Sendable {
         }
 
         return pixelBuffer
+    }
+
+    // MARK: - 高清短视频封面图生成器
+
+    /// 自动为短视频/有声书生成一张精美的 9:16 / 16:9 / 1:1 高清设计封面图（用于各平台上传）。
+    public static func generateCoverImage(
+        title: String,
+        chapter: String? = nil,
+        theme: BackgroundTheme = .pureBlack,
+        aspectRatio: VideoAspectRatio = .portrait9_16,
+        quality: VideoQuality = .p1080,
+        highlightColor: CaptionColor = .vividOrange,
+        outputURL: URL
+    ) throws {
+        let res = VideoResolution.make(aspectRatio: aspectRatio, quality: quality)
+        let w = res.width
+        let h = res.height
+        let scale = CGFloat(Double(h) / 1080.0)
+
+        guard let ctx = CGContext(
+            data: nil,
+            width: w,
+            height: h,
+            bitsPerComponent: 8,
+            bytesPerRow: w * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else {
+            throw BookStreamError.videoRenderFailed("无法分配封面位图画布")
+        }
+
+        let fullRect = CGRect(x: 0, y: 0, width: w, height: h)
+
+        // 1. 底色与渐变
+        switch theme {
+        case .pureBlack:
+            ctx.setFillColor(NSColor.black.cgColor)
+            ctx.fill(fullRect)
+        case .darkGradient:
+            let colors = [
+                NSColor(calibratedRed: 0.08, green: 0.12, blue: 0.22, alpha: 1.0).cgColor,
+                NSColor(calibratedRed: 0.02, green: 0.03, blue: 0.06, alpha: 1.0).cgColor,
+                NSColor.black.cgColor
+            ] as CFArray
+            if let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: [0.0, 0.45, 1.0]) {
+                ctx.drawLinearGradient(grad, start: CGPoint(x: CGFloat(w)/2, y: CGFloat(h)), end: CGPoint(x: CGFloat(w)/2, y: 0), options: [])
+            }
+        case .charcoal:
+            let colors = [
+                NSColor(calibratedRed: 0.14, green: 0.14, blue: 0.15, alpha: 1.0).cgColor,
+                NSColor(calibratedRed: 0.04, green: 0.04, blue: 0.05, alpha: 1.0).cgColor
+            ] as CFArray
+            if let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: [0.0, 1.0]) {
+                ctx.drawLinearGradient(grad, start: CGPoint(x: CGFloat(w)/2, y: CGFloat(h)), end: CGPoint(x: CGFloat(w)/2, y: 0), options: [])
+            }
+        case .midnightPurple:
+            let colors = [
+                NSColor(calibratedRed: 0.12, green: 0.06, blue: 0.18, alpha: 1.0).cgColor,
+                NSColor(calibratedRed: 0.02, green: 0.01, blue: 0.04, alpha: 1.0).cgColor
+            ] as CFArray
+            if let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: [0.0, 1.0]) {
+                ctx.drawLinearGradient(grad, start: CGPoint(x: CGFloat(w)/2, y: CGFloat(h)), end: CGPoint(x: CGFloat(w)/2, y: 0), options: [])
+            }
+        }
+
+        // 2. 居中排版大标题与章节
+        let titleFont = NSFont.boldSystemFont(ofSize: 42 * scale)
+        let chFont = NSFont.systemFont(ofSize: 24 * scale, weight: .medium)
+        let tagFont = NSFont.monospacedSystemFont(ofSize: 16 * scale, weight: .semibold)
+
+        let tagAttr = NSAttributedString(string: "AUDIOBOOK · 精品有声书", attributes: [
+            .font: tagFont,
+            .foregroundColor: highlightColor.nsColor.withAlphaComponent(0.85),
+        ])
+        let titleAttr = NSAttributedString(string: title, attributes: [
+            .font: titleFont,
+            .foregroundColor: NSColor.white,
+        ])
+
+        let tagSize = tagAttr.size()
+        let titleSize = titleAttr.size()
+
+        let centerY = CGFloat(h) * 0.52
+        tagAttr.draw(at: CGPoint(x: (CGFloat(w) - tagSize.width) / 2, y: centerY + 45 * scale))
+        titleAttr.draw(at: CGPoint(x: (CGFloat(w) - titleSize.width) / 2, y: centerY - titleSize.height / 2))
+
+        if let ch = chapter, !ch.isEmpty {
+            let chAttr = NSAttributedString(string: ch, attributes: [
+                .font: chFont,
+                .foregroundColor: NSColor(white: 0.78, alpha: 1.0),
+            ])
+            let chSize = chAttr.size()
+            chAttr.draw(at: CGPoint(x: (CGFloat(w) - chSize.width) / 2, y: centerY - 65 * scale))
+        }
+
+        // 3. 装饰金线
+        ctx.setFillColor(highlightColor.nsColor.withAlphaComponent(0.70).cgColor)
+        ctx.fill(CGRect(x: (CGFloat(w) - 120 * scale) / 2, y: centerY - 25 * scale, width: 120 * scale, height: 2 * scale))
+
+        guard let img = ctx.makeImage() else {
+            throw BookStreamError.videoRenderFailed("封面图导出失败")
+        }
+
+        let rep = NSBitmapImageRep(cgImage: img)
+        guard let jpegData = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.92]) else {
+            throw BookStreamError.videoRenderFailed("封面图 JPEG 编码失败")
+        }
+        try jpegData.write(to: outputURL)
     }
 
     // MARK: - 水印
@@ -1364,50 +1761,137 @@ public final class VideoRenderer: @unchecked Sendable {
         return image
     }
 
-    private func drawWatermark(_ wm: WatermarkSettings, in ctx: CGContext, canvas: CGSize) {
+    private func drawWatermark(_ wm: WatermarkSettings, time: Double, in ctx: CGContext, canvas: CGSize) {
         let scale = CGFloat(canvas.height / 1080.0)
         let margin: CGFloat = 26 * scale
-        let text = wm.text.isEmpty ? "BookStream" : wm.text
 
-        if let data = wm.imageData, let image = loadWatermarkImage(data) {
-            let w = canvas.width * CGFloat(wm.imageScale)
-            let h = w * CGFloat(image.height) / CGFloat(image.width)
-            let origin = watermarkRectOrigin(size: CGSize(width: w, height: h), position: wm.position, canvas: canvas, margin: margin)
-            ctx.saveGState()
-            ctx.setAlpha(CGFloat(wm.opacity))
-            // 本上下文是非翻转（y 向上、无 CTM 翻转），CGImage 直接 draw 即为正向。
-            // 勿用 translateBy+scaleBy(-1)：位图上下文非翻转时追加该翻转会把图片旋转 180°
-            // （上下颠倒+左右镜像），与文字 CTFrameDraw 已知的翻转陷阱是同一类问题。
-            ctx.draw(image, in: CGRect(x: origin.x, y: origin.y, width: w, height: h))
-            ctx.restoreGState()
-        } else {
-            let font = NSFont.systemFont(ofSize: CGFloat(wm.fontSize) * scale, weight: .regular)
-            let attr = NSMutableAttributedString(string: text, attributes: [
+        // 1. 绘制图片水印 (Logo)，如果启用且已导入图片
+        if wm.enableImage, let data = wm.imageData, let img = loadWatermarkImage(data) {
+            let imgW = canvas.width * CGFloat(wm.imageScale)
+            let imgH = imgW * CGFloat(img.height) / CGFloat(img.width)
+            let imgSize = CGSize(width: imgW, height: imgH)
+
+            let placement = computeWatermarkPlacement(
+                size: imgSize,
+                position: wm.imagePosition,
+                motion: wm.imageMotion,
+                time: time,
+                canvas: canvas,
+                margin: margin,
+                scale: scale,
+                baseOpacity: wm.imageOpacity,
+                speedMultiplier: 1.0,
+                phaseSeed: 0
+            )
+
+            if placement.alpha > 0.01 {
+                ctx.saveGState()
+                ctx.setAlpha(placement.alpha)
+                ctx.draw(img, in: CGRect(x: placement.origin.x, y: placement.origin.y, width: imgSize.width, height: imgSize.height))
+                ctx.restoreGState()
+            }
+        }
+
+        // 2. 绘制文字水印 (Text)，如果启用且文本非空
+        if wm.enableText && !wm.text.isEmpty {
+            let font = NSFont.systemFont(ofSize: CGFloat(wm.fontSize) * scale, weight: .semibold)
+            let attr = NSMutableAttributedString(string: wm.text, attributes: [
                 .font: font,
                 .foregroundColor: wm.color.nsColor,
             ])
-            let line = CTLineCreateWithAttributedString(attr)
-            var ascent: CGFloat = 0
-            var descent: CGFloat = 0
-            let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, nil))
-            let size = CGSize(width: width, height: ascent + descent)
-            let x: CGFloat
-            switch wm.position {
-            case .topLeft, .midLeft, .bottomLeft: x = margin
-            case .topCenter, .center, .bottomCenter: x = (canvas.width - size.width) / 2
-            case .topRight, .midRight, .bottomRight: x = canvas.width - margin - size.width
+            let ctLine = CTLineCreateWithAttributedString(attr)
+            var asc: CGFloat = 0, dsc: CGFloat = 0
+            let textW = CGFloat(CTLineGetTypographicBounds(ctLine, &asc, &dsc, nil))
+            let textSize = CGSize(width: textW, height: asc + dsc)
+
+            let placement = computeWatermarkPlacement(
+                size: textSize,
+                position: wm.position,
+                motion: wm.motion,
+                time: time,
+                canvas: canvas,
+                margin: margin,
+                scale: scale,
+                baseOpacity: wm.opacity,
+                speedMultiplier: 1.15,
+                phaseSeed: 1
+            )
+
+            if placement.alpha > 0.01 {
+                ctx.saveGState()
+                ctx.setAlpha(placement.alpha)
+                ctx.textPosition = CGPoint(x: placement.origin.x, y: placement.origin.y + dsc)
+                CTLineDraw(ctLine, ctx)
+                ctx.restoreGState()
             }
-            let blockBottom: CGFloat
-            switch wm.position {
-            case .topLeft, .topCenter, .topRight: blockBottom = canvas.height - margin - size.height
-            case .midLeft, .center, .midRight: blockBottom = (canvas.height - size.height) / 2
-            case .bottomLeft, .bottomCenter, .bottomRight: blockBottom = margin
+        }
+    }
+
+    /// 统一计算水印位置与透明度（支持固定位置、打砖块漫步反弹、周期性优雅掠影）
+    private func computeWatermarkPlacement(
+        size: CGSize,
+        position: WatermarkSettings.Position,
+        motion: WatermarkSettings.Motion,
+        time: Double,
+        canvas: CGSize,
+        margin: CGFloat,
+        scale: CGFloat,
+        baseOpacity: Double,
+        speedMultiplier: Double,
+        phaseSeed: Int
+    ) -> (origin: CGPoint, alpha: CGFloat) {
+        switch motion {
+        case .static:
+            let origin = watermarkRectOrigin(size: size, position: position, canvas: canvas, margin: margin)
+            return (origin, CGFloat(baseOpacity))
+
+        case .bouncingDrift:
+            // 打砖块慢速弹球游走模式：2D 连续反弹，平稳温润漫步（无法被固定打码或裁切，强防搬运）
+            let availW = max(10, canvas.width - size.width - margin * 2)
+            let availH = max(10, canvas.height - size.height - margin * 2)
+
+            let speedX: Double = 30.0 * Double(scale) * speedMultiplier
+            let speedY: Double = 20.0 * Double(scale) * speedMultiplier
+            let offsetBase = Double(phaseSeed) * 140.0
+
+            let modX = (time * speedX + 120.0 + offsetBase).truncatingRemainder(dividingBy: Double(availW * 2.0))
+            let curX = margin + (modX < Double(availW) ? CGFloat(modX) : CGFloat(Double(availW * 2.0) - modX))
+
+            let modY = (time * speedY + 60.0 + offsetBase * 0.7).truncatingRemainder(dividingBy: Double(availH * 2.0))
+            let curY = margin + (modY < Double(availH) ? CGFloat(modY) : CGFloat(Double(availH * 2.0) - modY))
+
+            return (CGPoint(x: curX, y: curY), CGFloat(baseOpacity))
+
+        case .periodicFlythrough:
+            // 周期性横掠飘过（每 22 秒掠过一次，持续 5.5s，淡入 -> 匀速滑行 -> 淡出）
+            let cycle: Double = 22.0
+            let flightDur: Double = 5.5
+            let cycleIdx = Int(time / cycle) + phaseSeed * 3
+            let cycleTime = (time + Double(phaseSeed) * 7.5).truncatingRemainder(dividingBy: cycle)
+
+            if cycleTime < flightDur {
+                let p = cycleTime / flightDur // 0 to 1
+                let startPosX = -size.width - 20
+                let endPosX = canvas.width + 20
+                let curX = startPosX + CGFloat(p) * (endPosX - startPosX)
+
+                // 伪随机各周期的纵向高度（主要在画面中上部与中下部游走，避免挡正中字幕）
+                let ySeed = sin(Double(cycleIdx) * 127.1) * 0.5 + 0.5
+                let baseYPos = canvas.height * (0.25 + 0.45 * CGFloat(ySeed))
+                let curY = baseYPos + 18.0 * scale * CGFloat(sin(p * .pi * 2.0))
+
+                let fadeAlpha: CGFloat
+                if p < 0.20 {
+                    fadeAlpha = CGFloat(p / 0.20)
+                } else if p > 0.80 {
+                    fadeAlpha = CGFloat((1.0 - p) / 0.20)
+                } else {
+                    fadeAlpha = 1.0
+                }
+                return (CGPoint(x: curX, y: curY), CGFloat(baseOpacity) * fadeAlpha)
+            } else {
+                return (.zero, 0)
             }
-            ctx.saveGState()
-            ctx.setAlpha(CGFloat(wm.opacity))
-            ctx.textPosition = CGPoint(x: x, y: blockBottom + descent)
-            CTLineDraw(line, ctx)
-            ctx.restoreGState()
         }
     }
 

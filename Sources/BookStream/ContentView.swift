@@ -73,6 +73,7 @@ final class AppModel: ObservableObject {
         case gentlePiano    = "舒缓和弦氛围乐 (内置)"
         case oceanWaves     = "海浪波涛·潮汐声 (内置)"
         case rainAmbience   = "沉浸雨声·雨滴白噪音 (内置)"
+        case fireplace      = "温暖壁炉·柴火噼啪 (内置)"
         case mountainStream = "山间小溪·潺潺流水 (内置)"
         case forestWind     = "林间微风·自然呼吸 (内置)"
         case darkNoise      = "暗噪音·深沉静谧 (内置)"
@@ -86,8 +87,13 @@ final class AppModel: ObservableObject {
     @Published var exportMode: ExportMode = .video
     @Published var highlightColor: CaptionColor = .vividOrange
     @Published var backgroundTheme: BackgroundTheme = .pureBlack
+    @Published var visualizerStyle: VisualizerStyle = .waveRibbon // 动态声波挂件样式（Siri 平滑光带 / 经典律动柱 / 关闭）
     @Published var showVisualizer: Bool = true
     @Published var enableKaraoke: Bool = true
+    @Published var enableIntroOutro: Bool = false // 优雅片头封面卡与片尾淡入淡出（1.5s，默认关闭）
+    @Published var enableParticles: Bool = true  // 深空星尘微光微粒背景
+    @Published var enableVocalWarmth: Bool = true // 录音棚电台级人声温暖度提升
+    @Published var autoGenerateCover: Bool = false // 视频渲染同时自动导出高清封面图（cover.jpg，默认关闭）
     @Published var subtitleFont: SubtitleFont = .systemDefault
     @Published var videoAspectRatio: VideoAspectRatio = .portrait9_16 // 默认 9:16 竖屏短视频
     @Published var videoQuality: VideoQuality = .p480
@@ -640,6 +646,8 @@ final class AppModel: ObservableObject {
                 return "bgm-ocean-\(Int(bgmVolume * 100))"
             case .rainAmbience:
                 return "bgm-rain-\(Int(bgmVolume * 100))"
+            case .fireplace:
+                return "bgm-fireplace-\(Int(bgmVolume * 100))"
             case .mountainStream:
                 return "bgm-stream-\(Int(bgmVolume * 100))"
             case .forestWind:
@@ -728,6 +736,7 @@ final class AppModel: ObservableObject {
         case .gentlePiano: bgmLabel = "舒缓和弦 (\(Int(bgmVolume * 100))%)"
         case .oceanWaves: bgmLabel = "海浪波涛 (\(Int(bgmVolume * 100))%)"
         case .rainAmbience: bgmLabel = "沉浸雨声 (\(Int(bgmVolume * 100))%)"
+        case .fireplace: bgmLabel = "温暖壁炉 (\(Int(bgmVolume * 100))%)"
         case .mountainStream: bgmLabel = "山间小溪 (\(Int(bgmVolume * 100))%)"
         case .forestWind: bgmLabel = "林间微风 (\(Int(bgmVolume * 100))%)"
         case .darkNoise: bgmLabel = "暗噪音 (\(Int(bgmVolume * 100))%)"
@@ -808,6 +817,10 @@ final class AppModel: ObservableObject {
             let temp = FileManager.default.temporaryDirectory.appendingPathComponent("bgm_rain_\(UUID().uuidString).wav")
             try AudioEngine.generateProceduralBGM(preset: "rain", totalSeconds: duration + 10, outputURL: temp)
             return (temp, "沉浸雨声", true)
+        case .fireplace:
+            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("bgm_fireplace_\(UUID().uuidString).wav")
+            try AudioEngine.generateProceduralBGM(preset: "fireplace", totalSeconds: duration + 10, outputURL: temp)
+            return (temp, "温暖壁炉", true)
         case .mountainStream:
             let temp = FileManager.default.temporaryDirectory.appendingPathComponent("bgm_stream_\(UUID().uuidString).wav")
             try AudioEngine.generateProceduralBGM(preset: "stream", totalSeconds: duration + 10, outputURL: temp)
@@ -992,7 +1005,15 @@ final class AppModel: ObservableObject {
                         audioURL: companion,
                         segments: segments,
                         outputURL: mp4URL,
-                        style: CaptionStyle(highlight: highlightColor, theme: backgroundTheme, showVisualizer: showVisualizer, font: subtitleFont, enableKaraoke: enableKaraoke),
+                        style: CaptionStyle(
+                            highlight: highlightColor,
+                            theme: backgroundTheme,
+                            visualizerStyle: visualizerStyle,
+                            font: subtitleFont,
+                            enableKaraoke: enableKaraoke,
+                            enableIntroOutro: enableIntroOutro,
+                            enableParticles: enableParticles
+                        ),
                         resolution: videoResolution,
                         codec: videoCodec,
                         watermark: watermark,
@@ -1013,6 +1034,7 @@ final class AppModel: ObservableObject {
                         piperVoice: selectedPiperVoice,
                         rate: speechRate,
                         overflowPolicy: subtitleOverflowPolicy,
+                        enableVocalWarmth: enableVocalWarmth,
                         progress: { [weak self] done, total in
                             self?.updateProgress(Double(done) / Double(max(total, 1)), text: "旁白抓轨 \(done)/\(total) 条")
                         },
@@ -1036,7 +1058,15 @@ final class AppModel: ObservableObject {
                         audioURL: wavURL,
                         segments: result.segments,
                         outputURL: mp4URL,
-                        style: CaptionStyle(highlight: highlightColor, theme: backgroundTheme, showVisualizer: showVisualizer, font: subtitleFont, enableKaraoke: enableKaraoke),
+                        style: CaptionStyle(
+                            highlight: highlightColor,
+                            theme: backgroundTheme,
+                            visualizerStyle: visualizerStyle,
+                            font: subtitleFont,
+                            enableKaraoke: enableKaraoke,
+                            enableIntroOutro: enableIntroOutro,
+                            enableParticles: enableParticles
+                        ),
                         resolution: videoResolution,
                         codec: videoCodec,
                         watermark: watermark,
@@ -1047,6 +1077,25 @@ final class AppModel: ObservableObject {
                         cancellation: cancelled
                     )
                     logPhaseCompletion(phase: "视频渲染", elapsed: Date().timeIntervalSince(renderStart), mediaDuration: totalDur)
+                }
+                if autoGenerateCover {
+                    let coverURL = base.deletingLastPathComponent().appendingPathComponent("\(base.lastPathComponent)-cover.jpg")
+                    let title = {
+                        switch input {
+                        case .book(let t, _): return t
+                        case .subtitles(let t, _): return t
+                        }
+                    }()
+                    try? VideoSynthesizer.generateCoverImage(
+                        title: title,
+                        chapter: nil,
+                        theme: backgroundTheme,
+                        aspectRatio: videoAspectRatio,
+                        quality: videoQuality,
+                        highlightColor: highlightColor,
+                        outputURL: coverURL
+                    )
+                    log("  封面图: 自动生成高清短视频封面（已写出 \(coverURL.lastPathComponent)）")
                 }
                 previewURL = mp4URL
                 progress = 1
@@ -1117,6 +1166,7 @@ final class AppModel: ObservableObject {
             piperVoice: selectedPiperVoice,
             rate: speechRate,
             pauseScale: pauseScale,
+            enableVocalWarmth: enableVocalWarmth,
             progress: { [weak self] done, total in
                 self?.updateProgress(Double(done) / Double(max(total, 1)), text: "\(prefix)TTS 抓轨 \(done)/\(total) 句")
             },
@@ -1163,7 +1213,15 @@ final class AppModel: ObservableObject {
             audioURL: wavURL,
             segments: result.segments,
             outputURL: mp4URL,
-            style: CaptionStyle(highlight: highlightColor, theme: backgroundTheme, showVisualizer: showVisualizer, font: subtitleFont, enableKaraoke: enableKaraoke),
+            style: CaptionStyle(
+                highlight: highlightColor,
+                theme: backgroundTheme,
+                visualizerStyle: visualizerStyle,
+                font: subtitleFont,
+                enableKaraoke: enableKaraoke,
+                enableIntroOutro: enableIntroOutro,
+                enableParticles: enableParticles
+            ),
             resolution: videoResolution,
             codec: videoCodec,
             watermark: watermark,
@@ -1175,6 +1233,29 @@ final class AppModel: ObservableObject {
         )
         logPhaseCompletion(phase: "\(prefix)视频渲染", elapsed: Date().timeIntervalSince(renderStart), mediaDuration: totalDur)
         outputs.append(mp4URL)
+
+        if autoGenerateCover {
+            let coverURL = base.deletingLastPathComponent().appendingPathComponent("\(base.lastPathComponent)-cover.jpg")
+            let bookTitle = {
+                switch self.inputKind {
+                case .book(let t, _): return t
+                case .subtitles(let t, _): return t
+                case nil: return "有声书"
+                }
+            }()
+            try? VideoSynthesizer.generateCoverImage(
+                title: bookTitle,
+                chapter: label,
+                theme: backgroundTheme,
+                aspectRatio: videoAspectRatio,
+                quality: videoQuality,
+                highlightColor: highlightColor,
+                outputURL: coverURL
+            )
+            outputs.append(coverURL)
+            log("  \(prefix)封面图: 自动生成高清短视频封面（已写出 \(coverURL.lastPathComponent)）")
+        }
+
         return (totalDur, mp4URL, outputs)
     }
 
@@ -1382,6 +1463,7 @@ struct ContentView: View {
                 fontPicker
                 karaokeSection
                 visualizerSection
+                cinematicEffectsSection
                 aspectRatioPicker
                 qualityPicker
                 codecPicker
@@ -1390,6 +1472,8 @@ struct ContentView: View {
                 if case .subtitles = model.inputKind {
                     companionAudioSection
                 }
+            } else {
+                vocalWarmthSection
             }
             if case .book = model.inputKind {
                 chapterExportSection
@@ -1770,7 +1854,33 @@ struct ContentView: View {
     }
 
     private var visualizerSection: some View {
-        Toggle("声波动态挂件（底部频带动效）", isOn: $model.showVisualizer)
+        VStack(alignment: .leading, spacing: 4) {
+            Text("动态声波挂件").font(.caption).foregroundStyle(.secondary)
+            Picker("声波样式", selection: $model.visualizerStyle) {
+                ForEach(VisualizerStyle.allCases) { s in
+                    Text(s.label).tag(s)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+        }
+    }
+
+    private var cinematicEffectsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle("片头封面与片尾渐隐 (1.5s)", isOn: $model.enableIntroOutro)
+                .font(.caption)
+            Toggle("深空微光呼吸与星尘背景", isOn: $model.enableParticles)
+                .font(.caption)
+            Toggle("自动生成高清短视频封面 (.jpg)", isOn: $model.autoGenerateCover)
+                .font(.caption)
+            Toggle("电台级录音棚人声温暖美化", isOn: $model.enableVocalWarmth)
+                .font(.caption)
+        }
+    }
+
+    private var vocalWarmthSection: some View {
+        Toggle("电台级录音棚人声温暖美化", isOn: $model.enableVocalWarmth)
             .font(.caption)
     }
 
@@ -1793,75 +1903,148 @@ struct ContentView: View {
 
     /// 水印（文本/图片，位置/大小/透明度可调）。
     private var watermarkSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Toggle("水印", isOn: wmBinding(\.enabled))
                 .font(.caption)
 
             if model.watermark.enabled {
-                Picker("类型", selection: Binding(
-                    get: { model.watermark.imageData == nil ? 0 : 1 },
-                    set: { kind in
-                        var wm = model.watermark
-                        if kind == 0 { wm.imageData = nil } else if wm.imageData == nil { wm.text = "" }
-                        model.updateWatermark(wm)
-                    }
-                )) {
-                    Text("文本").tag(0)
-                    Text("图片").tag(1)
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
+                // --- 1. 文字水印子面板 ---
+                VStack(alignment: .leading, spacing: 6) {
+                    Toggle("文字水印", isOn: wmBinding(\.enableText))
+                        .font(.caption)
 
-                if model.watermark.imageData == nil {
-                    HStack {
-                        TextField("水印文本", text: wmBinding(\.text))
-                            .textFieldStyle(.roundedBorder)
-                            .font(.caption)
-                        Button("导入图片") { importWatermarkImage() }
-                            .font(.caption)
-                    }
-                    HStack(spacing: 8) {
-                        Text("颜色").font(.caption).foregroundStyle(.secondary)
-                        ForEach(AppModel.paletteColors, id: \.self) { c in
-                            Circle()
-                                .fill(Color(nsColor: c.nsColor))
-                                .frame(width: 14, height: 14)
-                                .overlay(Circle().stroke(model.watermark.color == c ? Color.primary : Color.clear, lineWidth: 2))
-                                .contentShape(Circle())
-                                .onTapGesture { wmBinding(\.color).wrappedValue = c }
+                    if model.watermark.enableText {
+                        HStack {
+                            TextField("水印文本", text: wmBinding(\.text))
+                                .textFieldStyle(.roundedBorder)
+                                .font(.caption)
+                        }
+
+                        HStack(spacing: 8) {
+                            Text("颜色").font(.caption).foregroundStyle(.secondary)
+                            ForEach(AppModel.paletteColors, id: \.self) { c in
+                                Circle()
+                                    .fill(Color(nsColor: c.nsColor))
+                                    .frame(width: 14, height: 14)
+                                    .overlay(Circle().stroke(model.watermark.color == c ? Color.primary : Color.clear, lineWidth: 2))
+                                    .contentShape(Circle())
+                                    .onTapGesture { wmBinding(\.color).wrappedValue = c }
+                            }
+                        }
+
+                        HStack {
+                            Text("字号: \(Int(model.watermark.fontSize)) pt")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 82, alignment: .leading)
+                            Slider(value: wmBinding(\.fontSize), in: 14...72, step: 1)
+                        }
+
+                        HStack {
+                            Text("透明度: \(Int(round(model.watermark.opacity * 100)))%")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 82, alignment: .leading)
+                            Slider(value: wmBinding(\.opacity), in: 0.05...1.0, step: 0.01)
+                        }
+
+                        HStack {
+                            Text("形态").font(.caption).foregroundStyle(.secondary)
+                            Picker("形态", selection: wmBinding(\.motion)) {
+                                ForEach(WatermarkSettings.Motion.allCases) { m in
+                                    Text(m.label).tag(m)
+                                }
+                            }
+                            .labelsHidden()
+                        }
+
+                        if model.watermark.motion == .static {
+                            HStack {
+                                Text("位置").font(.caption).foregroundStyle(.secondary)
+                                Picker("位置", selection: wmBinding(\.position)) {
+                                    ForEach(WatermarkSettings.Position.allCases) { p in
+                                        Text(p.label).tag(p)
+                                    }
+                                }
+                                .labelsHidden()
+                            }
+                        } else if model.watermark.motion == .bouncingDrift {
+                            Text("💡 打砖块 2D 慢速平滑反弹游走，强力克制固定打码与搬运")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        } else if model.watermark.motion == .periodicFlythrough {
+                            Text("💡 每 22 秒优雅横掠滑过一次（淡入→飘移→淡出），不遮挡常驻阅读")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
                         }
                     }
-                } else {
-                    HStack {
-                        Text("已导入图片水印").font(.caption).foregroundStyle(.secondary)
-                        Spacer()
-                        Button("清除") { wmBinding(\.imageData).wrappedValue = nil }
-                            .font(.caption)
-                    }
                 }
+                .padding(6)
+                .background(Color.primary.opacity(0.04))
+                .cornerRadius(6)
 
-                HStack {
-                    Text(model.watermark.imageData == nil ? "字号" : "大小").font(.caption).foregroundStyle(.secondary)
-                    Slider(
-                        value: model.watermark.imageData == nil
-                            ? wmBinding(\.fontSize)
-                            : wmBinding(\.imageScale),
-                        in: model.watermark.imageData == nil ? 16...72 : 0.05...0.4
-                    )
-                }
-                HStack {
-                    Text("位置").font(.caption).foregroundStyle(.secondary)
-                    Picker("位置", selection: wmBinding(\.position)) {
-                        ForEach(WatermarkSettings.Position.allCases) { p in
-                            Text(p.label).tag(p)
+                // --- 2. 图片 Logo 水印子面板 ---
+                VStack(alignment: .leading, spacing: 6) {
+                    Toggle("图片 Logo 水印", isOn: wmBinding(\.enableImage))
+                        .font(.caption)
+
+                    if model.watermark.enableImage {
+                        if model.watermark.imageData == nil {
+                            Button("导入 Logo 图片文件 (PNG/JPEG)...") { importWatermarkImage() }
+                                .font(.caption)
+                        } else {
+                            HStack {
+                                Text("已导入 Logo 图片").font(.caption).foregroundStyle(.secondary)
+                                Spacer()
+                                Button("更换") { importWatermarkImage() }
+                                    .font(.caption)
+                                Button("清除") { wmBinding(\.imageData).wrappedValue = nil }
+                                    .font(.caption)
+                            }
+
+                            HStack {
+                                Text("缩放: \(Int(round(model.watermark.imageScale * 100)))%")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 82, alignment: .leading)
+                                Slider(value: wmBinding(\.imageScale), in: 0.05...0.40, step: 0.01)
+                            }
+
+                            HStack {
+                                Text("透明度: \(Int(round(model.watermark.imageOpacity * 100)))%")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 82, alignment: .leading)
+                                Slider(value: wmBinding(\.imageOpacity), in: 0.05...1.0, step: 0.01)
+                            }
+
+                            HStack {
+                                Text("形态").font(.caption).foregroundStyle(.secondary)
+                                Picker("形态", selection: wmBinding(\.imageMotion)) {
+                                    ForEach(WatermarkSettings.Motion.allCases) { m in
+                                        Text(m.label).tag(m)
+                                    }
+                                }
+                                .labelsHidden()
+                            }
+
+                            if model.watermark.imageMotion == .static {
+                                HStack {
+                                    Text("位置").font(.caption).foregroundStyle(.secondary)
+                                    Picker("位置", selection: wmBinding(\.imagePosition)) {
+                                        ForEach(WatermarkSettings.Position.allCases) { p in
+                                            Text(p.label).tag(p)
+                                        }
+                                    }
+                                    .labelsHidden()
+                                }
+                            }
                         }
                     }
-                    .labelsHidden()
                 }
-                HStack {
-                    Text("透明度").font(.caption).foregroundStyle(.secondary)
-                    Slider(value: wmBinding(\.opacity), in: 0.05...1.0)
-                }
+                .padding(6)
+                .background(Color.primary.opacity(0.04))
+                .cornerRadius(6)
             }
         }
     }
@@ -1875,7 +2058,7 @@ struct ContentView: View {
             let data = try Data(contentsOf: url)
             var wm = model.watermark
             wm.imageData = data
-            wm.text = ""
+            wm.enableImage = true
             model.updateWatermark(wm)
             model.log("已导入水印图片: \(url.lastPathComponent)")
         } catch {

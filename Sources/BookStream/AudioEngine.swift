@@ -120,6 +120,7 @@ public final class AudioEngine: @unchecked Sendable {
         piperVoice: PiperVoice? = nil,
         rate: Float,
         pauseScale: Float = 1.0,
+        enableVocalWarmth: Bool = true,
         progress: @escaping @Sendable @MainActor (Int, Int) -> Void,
         cancellation: @escaping @Sendable () -> Bool
     ) async throws -> SynthResult {
@@ -134,6 +135,7 @@ public final class AudioEngine: @unchecked Sendable {
                             piperVoice: piperVoice,
                             rate: rate,
                             pauseScale: pauseScale,
+                            enableVocalWarmth: enableVocalWarmth,
                             progress: progress,
                             cancellation: cancellation
                         )
@@ -157,6 +159,7 @@ public final class AudioEngine: @unchecked Sendable {
         piperVoice: PiperVoice? = nil,
         rate: Float,
         overflowPolicy: SubtitleOverflowPolicy = .extend,
+        enableVocalWarmth: Bool = true,
         progress: @escaping @Sendable @MainActor (Int, Int) -> Void,
         cancellation: @escaping @Sendable () -> Bool
     ) async throws -> SynthResult {
@@ -171,6 +174,7 @@ public final class AudioEngine: @unchecked Sendable {
                             piperVoice: piperVoice,
                             rate: rate,
                             overflowPolicy: overflowPolicy,
+                            enableVocalWarmth: enableVocalWarmth,
                             progress: progress,
                             cancellation: cancellation
                         )
@@ -192,6 +196,7 @@ public final class AudioEngine: @unchecked Sendable {
         piperVoice: PiperVoice?,
         rate: Float,
         pauseScale: Float,
+        enableVocalWarmth: Bool = true,
         progress: @escaping @Sendable @MainActor (Int, Int) -> Void,
         cancellation: @escaping @Sendable () -> Bool
     ) throws -> SynthResult {
@@ -228,6 +233,9 @@ public final class AudioEngine: @unchecked Sendable {
                 let sentence = sentences[i]
                 let converted = try convertAll(perSentence[j], to: pcmMono44k)
                 for buf in converted {
+                    if enableVocalWarmth {
+                        Self.applyVocalWarmth(to: buf)
+                    }
                     try file.write(from: buf)
                 }
                 let voiceFrames = converted.reduce(0) { $0 + Int64($1.frameLength) }
@@ -262,6 +270,7 @@ public final class AudioEngine: @unchecked Sendable {
         piperVoice: PiperVoice?,
         rate: Float,
         overflowPolicy: SubtitleOverflowPolicy,
+        enableVocalWarmth: Bool = true,
         progress: @escaping @Sendable @MainActor (Int, Int) -> Void,
         cancellation: @escaping @Sendable () -> Bool
     ) throws -> SynthResult {
@@ -299,6 +308,11 @@ public final class AudioEngine: @unchecked Sendable {
                 piperVoice: piperVoice
             )
             let converted = try convertAll(rawBuffers, to: pcmMono44k)
+            if enableVocalWarmth {
+                for buf in converted {
+                    Self.applyVocalWarmth(to: buf)
+                }
+            }
             let voiceFrames = converted.reduce(0) { $0 + Int64($1.frameLength) }
 
             switch overflowPolicy {
@@ -771,6 +785,20 @@ public final class AudioEngine: @unchecked Sendable {
                 ptr[i] = pink * 0.60
             }
 
+        case "fireplace":
+            // 温暖壁炉·柴火噼啪（深沉木材暗噪底色 + 随机火星噼啪爆鸣）
+            var rumble: Float = 0
+            for i in 0..<totalFrames {
+                let white = Float.random(in: -1.0...1.0)
+                rumble = (rumble + (0.015 * white)) / 1.015
+                var s = rumble * 1.8 * 0.45
+                if Float.random(in: 0...1.0) < 0.00018 {
+                    let crackleAmp = Float.random(in: 0.15...0.40)
+                    s += crackleAmp * (Float.random(in: 0...1) > 0.5 ? 1.0 : -1.0)
+                }
+                ptr[i] = s * 0.50
+            }
+
         default:
             // 舒缓和弦氛围乐（Cmaj7 -> Am7 -> Fmaj7 -> Gsus4 循环流动，标准饱满泛音）
             let chords: [[Float]] = [
@@ -809,6 +837,26 @@ public final class AudioEngine: @unchecked Sendable {
         ]
         let outFile = try AVAudioFile(forWriting: outputURL, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
         try outFile.write(from: buf)
+    }
+
+    /// 电台广播级人声温暖度提升与录音棚微空间混响（消除干涩，增加磁性与临场感）。
+    public static func applyVocalWarmth(to buffer: AVAudioPCMBuffer) {
+        guard let channelData = buffer.floatChannelData else { return }
+        let numChannels = Int(buffer.format.channelCount)
+        let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else { return }
+
+        for ch in 0..<numChannels {
+            let data = channelData[ch]
+            var w0: Float = 0, w1: Float = 0
+            for i in 0..<frameCount {
+                let x = data[i]
+                w0 = 0.96 * w0 + 0.04 * x
+                w1 = 0.85 * w1 + 0.15 * (x - w0)
+                let enhanced = x + (w0 * 0.22) + (w1 * 0.18)
+                data[i] = tanh(enhanced * 0.96)
+            }
+        }
     }
 }
 
