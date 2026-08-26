@@ -800,10 +800,10 @@ public final class VideoRenderer: @unchecked Sendable {
         scale: CGFloat,
         maxWidth: CGFloat
     ) -> [LineLayout] {
-        let fontHighlight = Self.makeFont(named: style.font, size: 72 * scale, weight: .bold)
-        let fontHighlightSub = Self.makeFont(named: style.font, size: 46 * scale, weight: .medium)
-        let fontNormal = Self.makeFont(named: style.font, size: 44 * scale, weight: .regular)
-        let fontNormalSub = Self.makeFont(named: style.font, size: 28 * scale, weight: .regular)
+        let fontHighlight = Self.makeFont(named: style.font, size: 58 * scale, weight: .bold)
+        let fontHighlightSub = Self.makeFont(named: style.font, size: 36 * scale, weight: .medium)
+        let fontNormal = Self.makeFont(named: style.font, size: 36 * scale, weight: .regular)
+        let fontNormalSub = Self.makeFont(named: style.font, size: 24 * scale, weight: .regular)
 
         let fontHighlightBox = UncheckedSendableBox(fontHighlight)
         let fontHighlightSubBox = UncheckedSendableBox(fontHighlightSub)
@@ -816,9 +816,9 @@ public final class VideoRenderer: @unchecked Sendable {
         let colorSubCurrentBox = UncheckedSendableBox(NSColor(calibratedRed: 0.90, green: 0.90, blue: 0.92, alpha: 0.88))
 
         // 生成 3 种排版：
-        // 0: 普通字号（44pt 主行 + 28pt 译文）
-        // 1: 居中当前句底色（72pt 主行 + 46pt 译文，白/微透色）
-        // 2: 居中当前句高亮色（72pt 主行高亮色 + 46pt 译文优雅白）
+        // 0: 普通字号（36pt 主行 + 24pt 译文）
+        // 1: 居中当前句底色（58pt 主行 + 36pt 译文，白/微透色）
+        // 2: 居中当前句高亮色（58pt 主行高亮色 + 36pt 译文优雅白）
         let box = ConcurrentBufferBox<LineLayout>(count: segments.count * 3)
         DispatchQueue.concurrentPerform(iterations: segments.count) { i in
             let seg = segments[i]
@@ -977,7 +977,7 @@ public final class VideoRenderer: @unchecked Sendable {
             guard let y = yCenter[i - lo] else { return }
             guard y > -320 * scale, y < canvas.height + 320 * scale else { return }
 
-            let baseRatio: CGFloat = 44.0 / 72.0 // 0.6111 常规与高亮字号比率
+            let baseRatio: CGFloat = 36.0 / 58.0 // 0.62069 常规与高亮字号比率
 
             if isCurrent {
                 let baseLayout = layouts[i * 3 + 1]
@@ -1129,12 +1129,13 @@ public final class VideoRenderer: @unchecked Sendable {
         let ps = NSMutableParagraphStyle()
         ps.alignment = .center
         ps.lineBreakMode = .byWordWrapping
-        ps.lineSpacing = 5 * scale
+        ps.lineSpacing = 4 * scale
 
         let subPs = NSMutableParagraphStyle()
         subPs.alignment = .center
         subPs.lineBreakMode = .byWordWrapping
-        subPs.paragraphSpacingBefore = 12 * scale
+        subPs.paragraphSpacingBefore = 10 * scale
+        subPs.lineSpacing = 3 * scale
 
         let primaryCharCount = (text as NSString).length
         let hasTranslation = (translation?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
@@ -1168,11 +1169,12 @@ public final class VideoRenderer: @unchecked Sendable {
             framesetter,
             CFRange(location: 0, length: 0),
             nil,
-            CGSize(width: maxWidth, height: 2400),
+            CGSize(width: maxWidth, height: 4000),
             nil
         )
         let w = max(1, Int(ceil(suggested.width)))
-        let h = max(1, Int(ceil(suggested.height)))
+        // 底部增加 16pt 安全边距，杜绝 CoreText 因行间距舍入导致的末行中文被意外截断
+        let h = max(1, Int(ceil(suggested.height))) + Int(ceil(16 * scale))
 
         func renderVariant(attr: NSAttributedString) -> (CGImage, [SubLineInfo], Int) {
             guard let ctx = CGContext(
@@ -1249,7 +1251,7 @@ public final class VideoRenderer: @unchecked Sendable {
         let ps = NSMutableParagraphStyle()
         ps.alignment = .center
         ps.lineBreakMode = .byWordWrapping
-        ps.lineSpacing = 5 * scale
+        ps.lineSpacing = 4 * scale
 
         let convertedColor = color.usingColorSpace(.sRGB) ?? color
         let convertedSub = subColor.usingColorSpace(.sRGB) ?? subColor
@@ -1267,7 +1269,8 @@ public final class VideoRenderer: @unchecked Sendable {
             let subPs = NSMutableParagraphStyle()
             subPs.alignment = .center
             subPs.lineBreakMode = .byWordWrapping
-            subPs.paragraphSpacingBefore = 12 * scale
+            subPs.paragraphSpacingBefore = 10 * scale
+            subPs.lineSpacing = 3 * scale
 
             let subAttr = NSAttributedString(string: "\n" + tr, attributes: [
                 .font: subFont,
@@ -1282,11 +1285,11 @@ public final class VideoRenderer: @unchecked Sendable {
             framesetter,
             CFRange(location: 0, length: 0),
             nil,
-            CGSize(width: maxWidth, height: 2400),
+            CGSize(width: maxWidth, height: 4000),
             nil
         )
         let w = max(1, Int(ceil(suggested.width)))
-        let h = max(1, Int(ceil(suggested.height)))
+        let h = max(1, Int(ceil(suggested.height))) + Int(ceil(16 * scale))
         let ctx = CGContext(
             data: nil,
             width: w,

@@ -72,11 +72,11 @@ final class AppModel: ObservableObject {
         VideoResolution.make(aspectRatio: videoAspectRatio, quality: videoQuality)
     }
 
-    // 全球顶级 AI 语音引擎体系（Kokoro-82M 离线神经网络 / 微软 Edge-TTS / 自定义 API）
-    @Published var selectedTTSEngine: TTSEngineType = .kokoro
-    @Published var selectedKokoroVoiceID: String = "af_heart"
-    @Published var selectedEdgeVoiceID: String = "zh-CN-YunxiNeural"
-    @Published var customAPISettings: CustomAPISettings = .default
+    // 全球顶级 AI 语音引擎体系（Kokoro-82M 离线神经网络 / 微软 Edge-TTS / 自定义 API，UserDefaults 记忆持久化）
+    @Published var selectedTTSEngine: TTSEngineType = AppModel.loadSelectedTTSEngine()
+    @Published var selectedKokoroVoiceID: String = AppModel.loadSelectedKokoroVoiceID()
+    @Published var selectedEdgeVoiceID: String = AppModel.loadSelectedEdgeVoiceID()
+    @Published var customAPISettings: CustomAPISettings = AppModel.loadCustomAPISettings()
 
     // 已有音频复用（字幕输入 + 视频模式时，可跳过 TTS）
     @Published var useExistingAudio = false
@@ -102,7 +102,7 @@ final class AppModel: ObservableObject {
 
     private var pipelineTask: Task<Void, Never>?
     private let cancelFlag = OSAllocatedUnfairLock(initialState: false)
-    private var hasUserPickedVoice = false
+    private var hasUserPickedVoice: Bool = AppModel.loadHasUserPickedVoice()
     private var previewAudioPlayer: AVAudioPlayer?
     private var previewSound: NSSound?
     /// 导出计时与进度日志状态（每次导出开始与阶段切换时重置）。
@@ -170,11 +170,22 @@ final class AppModel: ObservableObject {
 
     func initializeApp() {
         log("环境: \(Self.environmentSummary())")
-        log("AI 引擎就绪（默认使用 Kokoro-82M 顶级离线神经模型 · af_heart）")
+        let voiceName: String
+        switch selectedTTSEngine {
+        case .kokoro:
+            voiceName = KokoroTTS.popularVoices.first(where: { $0.id == selectedKokoroVoiceID })?.displayName ?? selectedKokoroVoiceID
+            log("AI 引擎就绪（当前使用 Kokoro-82M 顶级离线神经模型 · \(voiceName)）")
+        case .edgeTTS:
+            voiceName = EdgeTTS.popularVoices.first(where: { $0.id == selectedEdgeVoiceID })?.displayName ?? selectedEdgeVoiceID
+            log("AI 引擎就绪（当前使用 微软广播级 Neural 原声 · \(voiceName)）")
+        case .customAPI:
+            log("AI 引擎就绪（当前使用 自定义大模型 API · \(customAPISettings.provider.label)）")
+        }
     }
 
-    /// 按内容语言自动选择最佳配音（Kokoro / Edge-TTS）。
+    /// 按内容语言自动选择最佳配音（若用户已手动选择过喜爱的音色，则保持记忆不覆盖）。
     func selectDefaultVoice(for text: String?) {
+        guard !hasUserPickedVoice else { return }
         let language = Self.detectLanguage(of: text)
         if language == "zh-CN" {
             selectedKokoroVoiceID = "zm_yunxi"
@@ -253,10 +264,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 用户手动改过声音后，不再按内容语言自动切换。
-    func markVoicePickedByUser() {
-        hasUserPickedVoice = true
-    }
+
 
     /// 将 PCM 音频缓冲完整写入临时 WAV 文件（确保文件句柄关闭、Header 写入完整）
     nonisolated private static func writeBuffersToTempWav(_ buffers: [AVAudioPCMBuffer]) throws -> URL {
@@ -477,12 +485,13 @@ final class AppModel: ObservableObject {
         let stamp = Int(Date().timeIntervalSince1970)
         // 文件名格式：书名-音色名-[AI|sys]-语速-停顿x-分辨率-mark|nomark-时间戳.mp4
         // 例：1-danny-[AI]-0.5-1.0x-480p-mark-1787312689.mp4
-        let title = {
+        let rawTitle = {
             switch input {
             case .book(let t, _): return t
             case .subtitles(let t, _): return t
             }
         }()
+        let title = cleanSourceTitle(rawTitle)
         let (voiceCore, voiceTag): (String, String) = {
             switch selectedTTSEngine {
             case .kokoro:
@@ -631,6 +640,19 @@ final class AppModel: ObservableObject {
         return parts.trimmingCharacters(in: CharacterSet(charactersIn: " "))
     }
 
+    /// 从可能带有生成参数的旧文件名中提取纯净主标题（避免重复叠加参数）
+    private func cleanSourceTitle(_ raw: String) -> String {
+        if let range = raw.range(of: "-\\[(Kokoro|Edge|API|AI|sys)\\]", options: .regularExpression) {
+            let prefix = String(raw[..<range.lowerBound])
+            if let lastDash = prefix.lastIndex(of: "-") {
+                let core = String(prefix[..<lastDash])
+                if !core.isEmpty { return core }
+            }
+            return prefix.isEmpty ? raw : prefix
+        }
+        return raw
+    }
+
     /// 获取当前生效的背景音乐文件（若是内置预设，则即时合成对应时长的环绕音轨）。
     private func resolveBGM(duration: Double) throws -> (url: URL, label: String, isTemp: Bool)? {
         switch bgmPreset {
@@ -714,6 +736,11 @@ final class AppModel: ObservableObject {
                             onProgress: { [weak self] done, total in
                                 Task { @MainActor [weak self] in
                                     self?.updateProgress(Double(done) / Double(max(total, 1)), text: "双语翻译 \(done)/\(total) 句")
+                                }
+                            },
+                            onStatus: { [weak self] status in
+                                Task { @MainActor [weak self] in
+                                    self?.log(status)
                                 }
                             },
                             cancellation: cancelled
@@ -854,6 +881,8 @@ final class AppModel: ObservableObject {
                     let totalDur = entries.last?.end ?? 0
                     log("视频渲染（\(frameRate)fps \(videoResolution.label)，主题=\(backgroundTheme.label)）...")
                     let renderStart = Date()
+                    phaseStartTime = Date()
+                    lastLoggedPercent = -1
                     let renderer = VideoRenderer()
                     filesToCleanOnFailure = [mp4URL]
                     try await renderer.render(
@@ -882,6 +911,8 @@ final class AppModel: ObservableObject {
                 } else {
                     log("开始字幕旁白 TTS 抓轨（按原时间轴放置，视频音频轨复用）...")
                     let ttsStart = Date()
+                    phaseStartTime = Date()
+                    lastLoggedPercent = -1
                     let result = try await engine.renderSubtitleAudio(
                         entries: entries,
                         outputURL: wavURL,
@@ -909,6 +940,8 @@ final class AppModel: ObservableObject {
                     }
                     log("视频渲染（\(frameRate)fps \(videoResolution.label)，主题=\(backgroundTheme.label)）...")
                     let renderStart = Date()
+                    phaseStartTime = Date()
+                    lastLoggedPercent = -1
                     let renderer = VideoRenderer()
                     filesToCleanOnFailure = [wavURL, srtURL, assURL, mp4URL]
                     try await renderer.render(
@@ -1219,6 +1252,51 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private static func loadSelectedTTSEngine() -> TTSEngineType {
+        if let raw = UserDefaults.standard.string(forKey: "BookStream.selectedTTSEngine"),
+           let eng = TTSEngineType(rawValue: raw) {
+            return eng
+        }
+        return .kokoro
+    }
+
+    private static func loadSelectedKokoroVoiceID() -> String {
+        UserDefaults.standard.string(forKey: "BookStream.selectedKokoroVoiceID") ?? "af_heart"
+    }
+
+    private static func loadSelectedEdgeVoiceID() -> String {
+        UserDefaults.standard.string(forKey: "BookStream.selectedEdgeVoiceID") ?? "zh-CN-YunxiNeural"
+    }
+
+    private static func loadHasUserPickedVoice() -> Bool {
+        UserDefaults.standard.bool(forKey: "BookStream.hasUserPickedVoice")
+    }
+
+    private static func loadCustomAPISettings() -> CustomAPISettings {
+        guard let data = UserDefaults.standard.data(forKey: "BookStream.customAPISettings"),
+              let settings = try? JSONDecoder().decode(CustomAPISettings.self, from: data) else {
+            return .default
+        }
+        return settings
+    }
+
+    /// 保存音色与语音引擎设置到 UserDefaults
+    func saveVoiceSettings() {
+        UserDefaults.standard.set(selectedTTSEngine.rawValue, forKey: "BookStream.selectedTTSEngine")
+        UserDefaults.standard.set(selectedKokoroVoiceID, forKey: "BookStream.selectedKokoroVoiceID")
+        UserDefaults.standard.set(selectedEdgeVoiceID, forKey: "BookStream.selectedEdgeVoiceID")
+        UserDefaults.standard.set(hasUserPickedVoice, forKey: "BookStream.hasUserPickedVoice")
+        if let data = try? JSONEncoder().encode(customAPISettings) {
+            UserDefaults.standard.set(data, forKey: "BookStream.customAPISettings")
+        }
+    }
+
+    /// 用户手动改过声音后持久化标记，不再被文件语言重置。
+    func markVoicePickedByUser() {
+        hasUserPickedVoice = true
+        saveVoiceSettings()
+    }
+
     /// 测试大模型翻译连接
     func testTranslation() {
         let settings = translationSettings
@@ -1244,7 +1322,7 @@ final class AppModel: ObservableObject {
     /// 应用版本号（唯一代码侧出处）：优先取 Bundle（由 build.sh 打包写入），
     /// 无 Bundle（纯命令行模式）时回退默认。升级版本号改 build.sh 的 CFBundleShortVersionString 即可。
     static let appVersion: String = {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.2.0"
     }()
 
     /// 环境信息（debug 辅助）。
@@ -1454,7 +1532,10 @@ struct ContentView: View {
                 Text("AI 语音引擎").font(.caption).foregroundStyle(.secondary)
                 Spacer()
             }
-            Picker("引擎", selection: $model.selectedTTSEngine) {
+            Picker("引擎", selection: Binding(
+                get: { model.selectedTTSEngine },
+                set: { model.selectedTTSEngine = $0; model.saveVoiceSettings() }
+            )) {
                 ForEach(TTSEngineType.allCases) { eng in
                     Text(eng.label).tag(eng)
                 }
@@ -1470,7 +1551,10 @@ struct ContentView: View {
                         Button("试听") { model.previewKokoroVoice() }
                             .font(.caption)
                     }
-                    Picker("音色", selection: $model.selectedKokoroVoiceID) {
+                    Picker("音色", selection: Binding(
+                        get: { model.selectedKokoroVoiceID },
+                        set: { model.selectedKokoroVoiceID = $0; model.markVoicePickedByUser() }
+                    )) {
                         ForEach(KokoroTTS.popularVoices) { v in
                             Text("\(v.displayName) [\(v.tag)]").tag(v.id)
                         }
@@ -1491,7 +1575,10 @@ struct ContentView: View {
                         Button("试听") { model.previewEdgeVoice() }
                             .font(.caption)
                     }
-                    Picker("音色", selection: $model.selectedEdgeVoiceID) {
+                    Picker("音色", selection: Binding(
+                        get: { model.selectedEdgeVoiceID },
+                        set: { model.selectedEdgeVoiceID = $0; model.markVoicePickedByUser() }
+                    )) {
                         ForEach(EdgeTTS.popularVoices) { v in
                             Text("\(v.displayName) [\(v.tag)]").tag(v.id)
                         }
@@ -1518,6 +1605,7 @@ struct ContentView: View {
                     get: { model.customAPISettings.provider },
                     set: { newP in
                         model.customAPISettings.applyPreset(for: newP)
+                        model.saveVoiceSettings()
                     }
                 )) {
                     ForEach(CustomAPISettings.Provider.allCases) { p in
@@ -1529,30 +1617,42 @@ struct ContentView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 Text("API Key").font(.caption).foregroundStyle(.secondary)
-                SecureField(model.customAPISettings.provider == .custom ? "可选 / sk-..." : "sk-...", text: $model.customAPISettings.apiKey)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.caption)
+                SecureField(model.customAPISettings.provider == .custom ? "可选 / sk-..." : "sk-...", text: Binding(
+                    get: { model.customAPISettings.apiKey },
+                    set: { model.customAPISettings.apiKey = $0; model.saveVoiceSettings() }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
             }
 
             VStack(alignment: .leading, spacing: 3) {
                 Text("接口端点 URL").font(.caption).foregroundStyle(.secondary)
-                TextField("https://api.openai.com/v1/audio/speech", text: $model.customAPISettings.endpointURL)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.caption)
+                TextField("https://api.openai.com/v1/audio/speech", text: Binding(
+                    get: { model.customAPISettings.endpointURL },
+                    set: { model.customAPISettings.endpointURL = $0; model.saveVoiceSettings() }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
             }
 
             VStack(alignment: .leading, spacing: 3) {
                 Text("模型名称 (Model)").font(.caption).foregroundStyle(.secondary)
-                TextField("tts-1-hd", text: $model.customAPISettings.model)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.caption)
+                TextField("tts-1-hd", text: Binding(
+                    get: { model.customAPISettings.model },
+                    set: { model.customAPISettings.model = $0; model.saveVoiceSettings() }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
             }
 
             VStack(alignment: .leading, spacing: 3) {
                 Text("音色标识 (Voice ID)").font(.caption).foregroundStyle(.secondary)
-                TextField("onyx", text: $model.customAPISettings.voice)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.caption)
+                TextField("onyx", text: Binding(
+                    get: { model.customAPISettings.voice },
+                    set: { model.customAPISettings.voice = $0; model.markVoicePickedByUser() }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
             }
 
             HStack {
@@ -1599,8 +1699,8 @@ struct ContentView: View {
 
                     if model.translationSettings.provider != .builtInFree {
                         VStack(alignment: .leading, spacing: 3) {
-                            Text("接口端点 URL (Endpoint)").font(.caption).foregroundStyle(.secondary)
-                            TextField("https://api.deepseek.com/chat/completions 或 http://127.0.0.1:8000/v1/chat/completions", text: Binding(
+                            Text("接口 Base URL (自动适配各种格式)").font(.caption).foregroundStyle(.secondary)
+                            TextField("https://api.deepseek.com 或 http://127.0.0.1:8000", text: Binding(
                                 get: { model.translationSettings.endpointURL },
                                 set: { model.translationSettings.endpointURL = $0; model.saveTranslationSettings() }
                             ))

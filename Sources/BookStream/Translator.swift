@@ -19,8 +19,8 @@ public enum TranslationProvider: String, CaseIterable, Codable, Identifiable, Se
 
     public var defaultEndpoint: String {
         switch self {
-        case .deepseek: return "https://api.deepseek.com/chat/completions"
-        case .custom: return "http://127.0.0.1:8000/v1/chat/completions"
+        case .deepseek: return "https://api.deepseek.com"
+        case .custom: return "http://127.0.0.1:8000"
         case .builtInFree: return ""
         }
     }
@@ -68,11 +68,12 @@ public struct TranslationSettings: Codable, Equatable, Sendable {
 
 public enum Translator {
 
-    /// 批量翻译整本书籍的句子列表（保持上下文连贯与严格 1-to-1 映射）
+    /// 批量翻译整本书籍的句子列表（保持上下文连贯与严格 1-to-1 映射，支持断网重连与状态汇报）
     public static func translateBook(
         sentences: [Sentence],
         settings: TranslationSettings,
         onProgress: (@Sendable (Int, Int) -> Void)? = nil,
+        onStatus: (@Sendable (String) -> Void)? = nil,
         cancellation: (@Sendable () -> Bool)? = nil
     ) async throws -> [Sentence] {
         guard !sentences.isEmpty else { return [] }
@@ -111,6 +112,7 @@ public enum Translator {
             let translations = try await translateBatch(
                 items: batchItems,
                 settings: settings,
+                onStatus: onStatus,
                 cancellation: cancellation
             )
 
@@ -126,10 +128,11 @@ public enum Translator {
         return resultSentences
     }
 
-    /// 单批次结构化翻译（带重试与兜底容错）
+    /// 单批次结构化翻译（带断网等待重连、指数退避重试与兜底容错）
     private static func translateBatch(
         items: [(id: Int, text: String)],
         settings: TranslationSettings,
+        onStatus: (@Sendable (String) -> Void)? = nil,
         cancellation: (@Sendable () -> Bool)? = nil
     ) async throws -> [Int: String] {
         guard !items.isEmpty else { return [:] }
@@ -168,9 +171,10 @@ public enum Translator {
             requestBody["response_format"] = ["type": "json_object"]
         }
 
-        let endpoint = settings.endpointURL.isEmpty ? settings.provider.defaultEndpoint : settings.endpointURL
-        guard let url = URL(string: endpoint) else {
-            throw BookStreamError.audioRenderFailed("无效的翻译 API 端点: \(endpoint)")
+        let rawEndpoint = settings.endpointURL.isEmpty ? settings.provider.defaultEndpoint : settings.endpointURL
+        let resolvedEndpoint = normalizeEndpoint(rawEndpoint)
+        guard let url = URL(string: resolvedEndpoint) else {
+            throw BookStreamError.audioRenderFailed("无效的翻译 API 端点: \(rawEndpoint)")
         }
 
         var request = URLRequest(url: url)
@@ -182,32 +186,79 @@ public enum Translator {
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
 
-        let (data, response) = try await sendRequest(request: request, cancellation: cancellation)
-        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
-            let errStr = String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
-            throw BookStreamError.audioRenderFailed("翻译 API 错误 (\(http.statusCode)): \(errStr.prefix(160))")
-        }
+        let maxRetries = 5
+        var currentAttempt = 0
+        var lastError: Error?
 
-        // 解析返回 JSON
-        var resultMap: [Int: String] = [:]
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let choices = json["choices"] as? [[String: Any]],
-           let first = choices.first,
-           let msg = first["message"] as? [String: Any],
-           let content = msg["content"] as? String {
-            resultMap = parseTranslationJSON(content)
-        }
+        while currentAttempt < maxRetries {
+            if cancellation?() == true { throw BookStreamError.cancelled }
+            currentAttempt += 1
 
-        // 校验是否所有 item 都有对应翻译；如有缺失，单句补充兜底
-        for item in items {
-            if resultMap[item.id] == nil || resultMap[item.id]?.isEmpty == true {
-                // 备用免费轻量翻译兜底
-                let fallback = try await translateSingleFree(text: item.text)
-                resultMap[item.id] = fallback
+            do {
+                let (data, response) = try await sendRequest(request: request, cancellation: cancellation)
+                if let http = response as? HTTPURLResponse {
+                    if http.statusCode == 429 || (http.statusCode >= 500 && http.statusCode <= 504) {
+                        let delay = Double(currentAttempt) * 2.5
+                        onStatus?("⚠︎ 翻译 API 繁忙/限流 (\(http.statusCode))，等待 \(String(format: "%.1f", delay))s 后自动重试 [\(currentAttempt)/\(maxRetries)]...")
+                        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                        continue
+                    } else if http.statusCode >= 400 {
+                        let errStr = String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
+                        throw BookStreamError.audioRenderFailed("翻译 API 错误 (\(http.statusCode)): \(errStr.prefix(160))")
+                    }
+                }
+
+                // 解析返回 JSON
+                var resultMap: [Int: String] = [:]
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let choices = json["choices"] as? [[String: Any]],
+                   let first = choices.first,
+                   let msg = first["message"] as? [String: Any],
+                   let content = msg["content"] as? String {
+                    resultMap = parseTranslationJSON(content)
+                }
+
+                // 校验是否所有 item 都有对应翻译；如有缺失，单句补充兜底
+                for item in items {
+                    if resultMap[item.id] == nil || resultMap[item.id]?.isEmpty == true {
+                        // 备用免费轻量翻译兜底
+                        let fallback = try await translateSingleFree(text: item.text)
+                        resultMap[item.id] = fallback
+                    }
+                }
+
+                return resultMap
+            } catch {
+                if cancellation?() == true || (error as? BookStreamError) == .cancelled {
+                    throw BookStreamError.cancelled
+                }
+                lastError = error
+
+                let nsErr = error as NSError
+                let isNetworkDown = (nsErr.domain == NSURLErrorDomain && (
+                    nsErr.code == NSURLErrorNotConnectedToInternet ||
+                    nsErr.code == NSURLErrorNetworkConnectionLost ||
+                    nsErr.code == NSURLErrorTimedOut ||
+                    nsErr.code == NSURLErrorCannotConnectToHost ||
+                    nsErr.code == NSURLErrorDNSLookupFailed ||
+                    nsErr.code == NSURLErrorCannotFindHost
+                ))
+
+                if currentAttempt < maxRetries {
+                    let delay = Double(currentAttempt) * 3.0
+                    let reason = isNetworkDown ? "网络连接已中断 / 无法连接" : "请求异常 (\(error.localizedDescription))"
+                    onStatus?("⚠︎ \(reason)，正在等待重连，\(String(format: "%.1f", delay))s 后自动重试 [\(currentAttempt)/\(maxRetries)]...")
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                } else {
+                    break
+                }
             }
         }
 
-        return resultMap
+        if let lastError {
+            throw BookStreamError.audioRenderFailed("翻译网络重试已达上限: \(lastError.localizedDescription)")
+        }
+        throw BookStreamError.audioRenderFailed("翻译请求失败")
     }
 
     /// 内置轻量免配置翻译
@@ -314,6 +365,28 @@ public enum Translator {
                 continuation.resume(throwing: BookStreamError.cancelled)
             }
         }
+    }
+
+    /// 智能将用户输入的 Base URL 或各种格式端点规范化为 OpenAI 兼容的 /chat/completions 完整路径
+    public static func normalizeEndpoint(_ input: String) -> String {
+        var trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        if !trimmed.hasPrefix("http://") && !trimmed.hasPrefix("https://") {
+            trimmed = "http://" + trimmed
+        }
+        while trimmed.hasSuffix("/") {
+            trimmed.removeLast()
+        }
+        if trimmed.hasSuffix("/chat/completions") {
+            return trimmed
+        }
+        if trimmed.hasSuffix("/v1") {
+            return trimmed + "/chat/completions"
+        }
+        if trimmed.contains("api.deepseek.com") {
+            return trimmed + "/chat/completions"
+        }
+        return trimmed + "/v1/chat/completions"
     }
 
     /// 测试连接与翻译质量
