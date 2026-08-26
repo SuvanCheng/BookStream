@@ -887,10 +887,11 @@ public final class VideoRenderer: @unchecked Sendable {
             currentIdx = nil
         }
 
-        let rawLo = lowerBound(segments: segments, startAtLeast: time - rangeSeconds)
-        let rawHi = upperBound(segments: segments, startAtMost: time + rangeSeconds)
-        let lo = min(rawLo, currentIdx ?? rawLo)
-        let hi = max(rawHi, (currentIdx.map { $0 + 1 }) ?? rawHi)
+        let rawLo = lowerBound(segments: segments, startAtLeast: time - rangeSeconds * 1.8)
+        let rawHi = upperBound(segments: segments, startAtMost: time + rangeSeconds * 1.8)
+        let centerAnchor = currentIdx ?? upperBound(segments: segments, startAtMost: time)
+        let lo = max(0, min(rawLo, centerAnchor - 5))
+        let hi = min(segments.count, max(rawHi, centerAnchor + 6))
         guard lo < hi else { return currentIdx != nil }
 
         // ---- 2. 获取各句行高（O(1) 预热排版表读取）----
@@ -971,11 +972,36 @@ public final class VideoRenderer: @unchecked Sendable {
             }
         }
 
-        // ---- 4. 直接绘制（支持 macOS 风格平滑放大/缩小与触感弹簧动效）----
+        // 边缘平滑淡入淡出（Smoothstep 渐变曲线：底部 y=0~220px 柔和淡入，顶部向上隐入黑幕）
+        func edgeFadeFactor(y: CGFloat) -> CGFloat {
+            let bottomFadeHeight = 220.0 * scale
+            let topFadeHeight = 240.0 * scale
+            let topBoundary = canvas.height - 30.0 * scale
+
+            var fade: CGFloat = 1.0
+
+            if y < bottomFadeHeight {
+                let u = max(0.0, min(1.0, y / bottomFadeHeight))
+                fade *= (u * u * (3.0 - 2.0 * u))
+            }
+
+            let topDist = topBoundary - y
+            if topDist < topFadeHeight {
+                let u = max(0.0, min(1.0, topDist / topFadeHeight))
+                fade *= (u * u * (3.0 - 2.0 * u))
+            }
+
+            return max(0.0, min(1.0, fade))
+        }
+
+        // ---- 4. 直接绘制（支持 macOS 风格平滑放大/缩小、边缘无缝平滑滚入滚出）----
         func drawLine(_ i: Int, isCurrent: Bool) {
             let seg = segments[i]
             guard let y = yCenter[i - lo] else { return }
-            guard y > -320 * scale, y < canvas.height + 320 * scale else { return }
+            guard y > -100 * scale, y < canvas.height + 100 * scale else { return }
+
+            let edgeFade = edgeFadeFactor(y: y)
+            guard edgeFade > 0.001 else { return }
 
             let baseRatio: CGFloat = 36.0 / 58.0 // 0.62069 常规与高亮字号比率
 
@@ -1011,7 +1037,7 @@ public final class VideoRenderer: @unchecked Sendable {
                     ctx.scaleBy(x: scaleFactor, y: scaleFactor)
                     ctx.translateBy(x: -cx, y: -cy)
                 }
-                ctx.setAlpha(alpha)
+                ctx.setAlpha(alpha * edgeFade)
 
                 if style.enableKaraoke {
                     // 1. 先绘制底色字形
@@ -1071,7 +1097,7 @@ public final class VideoRenderer: @unchecked Sendable {
                     let u = CGFloat(dtOut / outDuration)
                     let p = 1.0 - pow(1.0 - u, 4)
                     let scaleFactor = 1.0 - (1.0 - baseRatio) * p
-                    let alpha = 1.0 - (1.0 - 0.40) * p
+                    let alpha = 1.0 - (1.0 - 0.38) * p
 
                     ctx.saveGState()
                     let cx = roundedX + w / 2
@@ -1079,19 +1105,12 @@ public final class VideoRenderer: @unchecked Sendable {
                     ctx.translateBy(x: cx, y: cy)
                     ctx.scaleBy(x: scaleFactor, y: scaleFactor)
                     ctx.translateBy(x: -cx, y: -cy)
-                    ctx.setAlpha(alpha)
+                    ctx.setAlpha(alpha * edgeFade)
                     ctx.draw(highLayout.image, in: rect)
                     ctx.restoreGState()
                 } else {
                     let layout = layouts[i * 3 + 0]
-                    let alpha: CGFloat
-                    if time < seg.start {
-                        let remaining = CGFloat(seg.start - time)
-                        alpha = min(0.40, max(0.18, 1.0 - remaining / 3.0 * 0.82))
-                    } else {
-                        let age = CGFloat(time - seg.end)
-                        alpha = max(0.15, 0.40 - age / 5.0 * 0.25)
-                    }
+                    let alpha: CGFloat = 0.38
 
                     let w = CGFloat(layout.image.width)
                     let h = CGFloat(layout.image.height)
@@ -1099,7 +1118,7 @@ public final class VideoRenderer: @unchecked Sendable {
                     let roundedY = round(y - h / 2)
                     let rect = CGRect(x: roundedX, y: roundedY, width: w, height: h)
 
-                    ctx.setAlpha(alpha)
+                    ctx.setAlpha(alpha * edgeFade)
                     ctx.draw(layout.image, in: rect)
                 }
             }
@@ -1832,19 +1851,6 @@ public final class VideoRenderer: @unchecked Sendable {
             ctx.setStrokeColor(coreColor.cgColor)
             ctx.addPath(pathMain)
             ctx.strokePath()
-
-            // 层 5：峰值微光星尘（讲话能量高时在波峰处点缀 3 颗细微流光粒子）
-            if !isFrameSilent && avgEnergy > 0.05 {
-                let sparkIndices = [points / 4, points / 2, points * 3 / 4]
-                for (idx, pIdx) in sparkIndices.enumerated() {
-                    let pt = ptsMain[pIdx]
-                    let sparkSize = CGFloat(2.8 + Double(idx) * 0.8) * scale
-                    let sparkAlpha = CGFloat(min(1.0, 0.5 + avgEnergy * 1.5))
-                    let sparkRect = CGRect(x: pt.x - sparkSize / 2, y: pt.y - sparkSize / 2, width: sparkSize, height: sparkSize)
-                    ctx.setFillColor(NSColor.white.withAlphaComponent(sparkAlpha).cgColor)
-                    ctx.fillEllipse(in: sparkRect)
-                }
-            }
 
             ctx.restoreGState()
         }

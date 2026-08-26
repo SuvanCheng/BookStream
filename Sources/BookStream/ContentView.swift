@@ -440,6 +440,14 @@ final class AppModel: ObservableObject {
                 } else {
                     log("SRT 解析完成: \(entries.count) 条（\(String(format: "%.2f", Date().timeIntervalSince(t0)))s）")
                 }
+                if let autoAudio = Self.findCompanionAudio(for: url) {
+                    companionAudioURL = autoAudio
+                    useExistingAudio = true
+                    log("  💡 已自动检测并关联同名音频: \(autoAudio.lastPathComponent)（已启用「复用音频·跳过TTS」极速渲染）")
+                } else {
+                    companionAudioURL = nil
+                    useExistingAudio = false
+                }
             case "ass", "ssa":
                 let entries = try await Task.detached(priority: .userInitiated) {
                     try AssParser.parse(url: url)
@@ -450,6 +458,14 @@ final class AppModel: ObservableObject {
                     entries: entries
                 )
                 log("ASS/SSA 解析完成: \(entries.count) 条")
+                if let autoAudio = Self.findCompanionAudio(for: url) {
+                    companionAudioURL = autoAudio
+                    useExistingAudio = true
+                    log("  💡 已自动检测并关联同名音频: \(autoAudio.lastPathComponent)（已启用「复用音频·跳过TTS」极速渲染）")
+                } else {
+                    companionAudioURL = nil
+                    useExistingAudio = false
+                }
             default:
                 throw BookStreamError.unsupportedFile(ext)
             }
@@ -651,6 +667,22 @@ final class AppModel: ObservableObject {
             return prefix.isEmpty ? raw : prefix
         }
         return raw
+    }
+
+    /// 尝试在字幕文件同目录下寻找匹配的同名音频文件（.wav, .m4a, .mp3, .aac, .flac, .aiff）
+    private static func findCompanionAudio(for subtitleURL: URL) -> URL? {
+        let dir = subtitleURL.deletingLastPathComponent()
+        let base = subtitleURL.deletingPathExtension().lastPathComponent
+        let candidateExtensions = ["wav", "m4a", "mp3", "aac", "flac", "aiff"]
+        let fm = FileManager.default
+
+        for ext in candidateExtensions {
+            let candidate = dir.appendingPathComponent(base).appendingPathExtension(ext)
+            if fm.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return nil
     }
 
     /// 获取当前生效的背景音乐文件（若是内置预设，则即时合成对应时长的环绕音轨）。
