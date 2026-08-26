@@ -381,10 +381,11 @@ public enum TextProcessor {
     }
 
     /// 解析书籍文件；完全保留电子书自身完整的标点与文本，绝不篡改标点；
-    /// `splitLong` 开启时按语法从句与自然停顿拆分超长句（>60字/140词）。
+    /// `splitLong` 开启时按语法从句与自然停顿拆分超长句（画幅自适应：9:16竖屏 ~36字/80字符，16:9横屏 ~60字/140字符）。
     public static func parseBookFile(
         url: URL,
-        splitLong: Bool = true
+        splitLong: Bool = true,
+        isPortrait: Bool = false
     ) throws -> (sentences: [Sentence], fixes: [TextFix]) {
         let ext = url.pathExtension.lowercased()
         let rawText: String
@@ -403,7 +404,9 @@ public enum TextProcessor {
 
         let parts = splitSentencesWithPauses(body3)
         if splitLong {
-            let (splitParts, splitFixes) = splitLongSentences(parts)
+            let maxZh = isPortrait ? 36 : 60
+            let maxEn = isPortrait ? 80 : 140
+            let (splitParts, splitFixes) = splitLongSentences(parts, maxChars: maxZh, maxEnglishChars: maxEn)
             fixes.append(contentsOf: splitFixes)
             guard !splitParts.isEmpty else { throw BookStreamError.unsupportedFile("空文本") }
             let splitSentences = splitParts.enumerated().map {
@@ -581,14 +584,15 @@ public enum TextProcessor {
             && scalars.contains { $0.isASCII && Character($0).isLetter }
     }
 
-    /// 把超过 maxChars 的句子按软边界拆短（L3）。
+    /// 把超过 maxChars/maxEnglishChars 的句子按软边界拆短（L3）。
     /// 拆分优先：分号 > 破折号 > 连词/副词从句 > 逗号。
     /// 返回拆分后的句子（首段停顿 0.35s，末段继承原句停顿）与拆分记录。
     public static func splitLongSentences(
         _ parts: [(text: String, pauseAfter: Double)],
-        maxChars: Int = 60
+        maxChars: Int = 60,
+        maxEnglishChars: Int = 140
     ) -> (parts: [(text: String, pauseAfter: Double)], fixes: [TextFix]) {
-        guard maxChars >= 20 else { return (parts, []) }
+        guard maxChars >= 15 else { return (parts, []) }
         // 每句所属段落号：pauseAfter>=1.0 的句子是段末
         var paraOf: [Int] = []
         var para = 1
@@ -599,8 +603,8 @@ public enum TextProcessor {
         var out: [(text: String, pauseAfter: Double)] = []
         var fixes: [TextFix] = []
         for (i, p) in parts.enumerated() {
-            // 英文有声书按语义从句流动，提高拆分阈值至 140 字符（避免误拆完整从句）；中文按 60 字
-            let limit = isEnglishText(p.text) ? max(maxChars, 140) : maxChars
+            // 英文按 maxEnglishChars，中文按 maxChars
+            let limit = isEnglishText(p.text) ? maxEnglishChars : maxChars
             guard p.text.count > limit else { out.append(p); continue }
             let pieces = splitLongText(p.text, maxChars: limit)
             guard pieces.count > 1 else { out.append(p); continue }

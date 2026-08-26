@@ -411,8 +411,9 @@ final class AppModel: ObservableObject {
             switch ext {
             case "txt", "epub":
                 let splitLong = splitLongSentences
+                let isPortrait = (videoAspectRatio == .portrait9_16)
                 let (sentences, fixes) = try await Task.detached(priority: .userInitiated) {
-                    try TextProcessor.parseBookFile(url: url, splitLong: splitLong)
+                    try TextProcessor.parseBookFile(url: url, splitLong: splitLong, isPortrait: isPortrait)
                 }.value
                 inputKind = .book(
                     title: url.deletingPathExtension().lastPathComponent,
@@ -1423,7 +1424,8 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 14) {
             topActionSection
             infoBox
-            Toggle("智能拆分超长句（>60字/140词）", isOn: $model.splitLongSentences)
+            let splitHint = model.videoAspectRatio == .portrait9_16 ? "9:16竖屏: ~36字/14词" : "16:9横屏: ~60字/25词"
+            Toggle("智能拆分超长句（\(splitHint)）", isOn: $model.splitLongSentences)
                 .font(.caption)
                 .onChange(of: model.splitLongSentences) { _ in
                     if let url = model.inputURL {
@@ -2050,6 +2052,11 @@ struct ContentView: View {
                 }
             }
             .labelsHidden()
+            .onChange(of: model.videoAspectRatio) { _ in
+                if case .book = model.inputKind, let url = model.inputURL {
+                    Task { await model.loadInput(url: url) }
+                }
+            }
         }
     }
 

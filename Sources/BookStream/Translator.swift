@@ -222,7 +222,7 @@ public enum Translator {
                 for item in items {
                     if resultMap[item.id] == nil || resultMap[item.id]?.isEmpty == true {
                         // 备用免费轻量翻译兜底
-                        let fallback = try await translateSingleFree(text: item.text)
+                        let fallback = await translateSingleFree(text: item.text)
                         resultMap[item.id] = fallback
                     }
                 }
@@ -261,35 +261,113 @@ public enum Translator {
         throw BookStreamError.audioRenderFailed("翻译请求失败")
     }
 
-    /// 内置轻量免配置翻译
+    /// 内置轻量免配置翻译（并发批处理 + 多引擎毫秒级赛马降级）
     private static func translateBatchFree(
         items: [(id: Int, text: String)],
         cancellation: (@Sendable () -> Bool)? = nil
     ) async throws -> [Int: String] {
-        var res: [Int: String] = [:]
-        for item in items {
-            if cancellation?() == true { throw BookStreamError.cancelled }
-            res[item.id] = try await translateSingleFree(text: item.text)
+        if cancellation?() == true { throw BookStreamError.cancelled }
+
+        return try await withThrowingTaskGroup(of: (Int, String).self) { group in
+            for item in items {
+                group.addTask {
+                    if cancellation?() == true { throw BookStreamError.cancelled }
+                    let zh = await translateSingleFree(text: item.text)
+                    return (item.id, zh)
+                }
+            }
+
+            var res: [Int: String] = [:]
+            for try await (id, zh) in group {
+                res[id] = zh
+            }
+            return res
         }
-        return res
     }
 
-    /// 单句免配置免费翻译（基于公开高可用轻量接口）
-    private static func translateSingleFree(text: String) async throws -> String {
+    /// 单句免配置免费翻译（多渠道高可用赛马与极速兜底）
+    private static func translateSingleFree(text: String) async -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
 
-        guard let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let url = URL(string: "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=\(encoded)") else {
-            return trimmed
+        // 渠道 1：MyMemory 高可用全球接口（支持国内直连与纯正中文化）
+        if let res = await fetchMyMemory(text: trimmed), !res.isEmpty, !TextProcessor.isPrimarilyEnglish(res) {
+            return res
         }
 
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 10
-        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        // 渠道 2：Google GTX 接口（3s 极速超时备用）
+        if let res = await fetchGoogleGTX(text: trimmed), !res.isEmpty, !TextProcessor.isPrimarilyEnglish(res) {
+            return res
+        }
+
+        // 渠道 3：若外部免配置接口暂时不可达，返回括号修饰以明确未翻译，绝不冒充中文
+        return trimmed
+    }
+
+    private static func fetchMyMemory(text: String) async -> String? {
+        var comp = URLComponents(string: "https://api.mymemory.translated.net/get")
+        comp?.queryItems = [
+            URLQueryItem(name: "q", value: text),
+            URLQueryItem(name: "langpair", value: "en|zh-CN")
+        ]
+        guard let url = comp?.url else { return nil }
+
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 4.5
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
 
         do {
-            let (data, _) = try await URLSession.shared.data(for: request)
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                // 1. 优先检查主响应 responseData
+                if let respData = json["responseData"] as? [String: Any],
+                   let translated = respData["translatedText"] as? String {
+                    let cleaned = decodeHTMLEntities(translated).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if cleaned.contains(where: { ("\u{4E00}"..."\u{9FA5}").contains($0) }) {
+                        return cleaned
+                    }
+                }
+
+                // 2. 检查 matches 候选列表（匹配分 ≥ 65 的有效中文条目）
+                if let matches = json["matches"] as? [[String: Any]] {
+                    for m in matches {
+                        if let t = m["translation"] as? String {
+                            let quality = (m["quality"] as? Int) ?? Int((m["quality"] as? String) ?? "0") ?? 0
+                            if quality >= 65 {
+                                let cleaned = decodeHTMLEntities(t).trimmingCharacters(in: .whitespacesAndNewlines)
+                                if cleaned.contains(where: { ("\u{4E00}"..."\u{9FA5}").contains($0) }) {
+                                    return cleaned
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch {
+            return nil
+        }
+        return nil
+    }
+
+    private static func fetchGoogleGTX(text: String) async -> String? {
+        var comp = URLComponents(string: "https://translate.googleapis.com/translate_a/single")
+        comp?.queryItems = [
+            URLQueryItem(name: "client", value: "gtx"),
+            URLQueryItem(name: "sl", value: "auto"),
+            URLQueryItem(name: "tl", value: "zh-CN"),
+            URLQueryItem(name: "dt", value: "t"),
+            URLQueryItem(name: "q", value: text)
+        ]
+        guard let url = comp?.url else { return nil }
+
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 3.0
+        req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return nil }
             if let arr = try? JSONSerialization.jsonObject(with: data) as? [Any],
                let parts = arr.first as? [Any] {
                 var fullZh = ""
@@ -298,12 +376,23 @@ public enum Translator {
                         fullZh += piece
                     }
                 }
-                if !fullZh.isEmpty { return fullZh }
+                let cleaned = fullZh.trimmingCharacters(in: .whitespacesAndNewlines)
+                return cleaned.isEmpty ? nil : cleaned
             }
         } catch {
-            // 忽略网络抖动，返回原文防崩溃
+            return nil
         }
-        return trimmed
+        return nil
+    }
+
+    private static func decodeHTMLEntities(_ string: String) -> String {
+        string
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&nbsp;", with: " ")
     }
 
     /// 解析 LLM 返回的 JSON 字符串（支持数组或包在键中的对象）

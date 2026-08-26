@@ -876,6 +876,10 @@ public final class VideoRenderer: @unchecked Sendable {
         canvas: CGSize
     ) -> Bool {
         guard !segments.isEmpty else { return false }
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.setAlpha(1.0)
+
         let centerY = canvas.height / 2
 
         // ---- 1. 判定当前句（二分定位）----
@@ -972,11 +976,11 @@ public final class VideoRenderer: @unchecked Sendable {
             }
         }
 
-        // 边缘平滑淡入淡出（Smoothstep 渐变曲线：底部 y=0~220px 柔和淡入，顶部向上隐入黑幕）
+        // 边缘平滑淡入淡出（Smoothstep 渐变曲线：底部 y=0~180px 柔和淡入，顶部 y=(H-180px)~H 柔和淡出）
         func edgeFadeFactor(y: CGFloat) -> CGFloat {
-            let bottomFadeHeight = 220.0 * scale
-            let topFadeHeight = 240.0 * scale
-            let topBoundary = canvas.height - 30.0 * scale
+            let bottomFadeHeight = 180.0 * scale
+            let topFadeHeight = 180.0 * scale
+            let topBoundary = canvas.height - 20.0 * scale
 
             var fade: CGFloat = 1.0
 
@@ -1118,8 +1122,10 @@ public final class VideoRenderer: @unchecked Sendable {
                     let roundedY = round(y - h / 2)
                     let rect = CGRect(x: roundedX, y: roundedY, width: w, height: h)
 
+                    ctx.saveGState()
                     ctx.setAlpha(alpha * edgeFade)
                     ctx.draw(layout.image, in: rect)
+                    ctx.restoreGState()
                 }
             }
         }
@@ -1666,6 +1672,9 @@ public final class VideoRenderer: @unchecked Sendable {
         canvas: CGSize
     ) {
         guard style != .off else { return }
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.setAlpha(1.0)
 
         let barCount = 36
         let frameIdx = min(max(0, Int(time * 60.0)), max(0, spectrum.count / barCount - 1))
@@ -1688,8 +1697,8 @@ public final class VideoRenderer: @unchecked Sendable {
             return
 
         case .bars:
-            // 经典律动柱（36 根胶囊柱对称分布）
-            let baseY: CGFloat = 24 * scale
+            // 经典律动柱（36 根胶囊柱对称分布于底部，置于字幕最上层）
+            let baseY: CGFloat = max(24 * scale, canvas.height * 0.025)
             let totalWidth: CGFloat = min(canvas.width - 40, 240 * scale)
             let barWidth: CGFloat = max(1.5, 2.8 * scale)
             let barGap = max(1.0, (totalWidth - CGFloat(barCount) * barWidth) / CGFloat(barCount - 1))
@@ -1730,17 +1739,17 @@ public final class VideoRenderer: @unchecked Sendable {
             }
 
         case .waveRibbon:
-            // Siri 极光流光多层光带（4 层流光谐波 + 极光色彩渐变 + 三次样条平滑曲线 + 峰值微光星尘）
+            // Siri 极光流光多层光带（4 层流光谐波 + 极光色彩渐变 + 三次样条平滑曲线，底部悬浮、恒定实体、永驻最上层）
             let baseY: CGFloat = max(44 * scale, canvas.height * 0.046)
             let ribbonWidth: CGFloat = min(canvas.width - 60, 440 * scale)
             let startX = (canvas.width - ribbonWidth) / 2
             let points = 80
             let step = ribbonWidth / CGFloat(points - 1)
 
-            // 提取高低频分量能量
+            // 提取高低频分量能量（连续线性推导，杜绝硬阈值跳变）
             var bassEnergy: CGFloat = 0
             var trebleEnergy: CGFloat = 0
-            if !spectrum.isEmpty && !isFrameSilent {
+            if !spectrum.isEmpty {
                 var bSum: Float = 0
                 for b in 0..<12 { bSum += spectrum[frameOffset + b] }
                 bassEnergy = CGFloat(bSum / 12.0)
@@ -1750,24 +1759,17 @@ public final class VideoRenderer: @unchecked Sendable {
                 trebleEnergy = CGFloat(tSum / Float(barCount - 12))
             }
 
-            // 静音时维持细腻呼吸波澜（~3px 优雅律动），讲话时充沛展开（最高 46px）
-            let idleBreath = CGFloat(0.5 * sin(time * 2.2))
-            let baseAmp: CGFloat = isFrameSilent ? ((3.0 + idleBreath) * scale) : min(46.0 * scale, (5.0 * scale + (bassEnergy * 26.0 + trebleEnergy * 15.0) * scale))
-            let speechAlpha: CGFloat = isFrameSilent ? 0.40 : (0.75 + avgEnergy * 0.25)
+            // 连续平滑动态增益（实体饱满、清晰明亮、随声音自然舒展）
+            let normEnergy = min(1.0, max(0.0, avgEnergy * 3.5))
+            let idleBreath = CGFloat(0.6 * sin(time * 2.4))
+            let dynamicWave = min(36.0 * scale, (bassEnergy * 24.0 + trebleEnergy * 14.0) * scale)
+            let baseAmp: CGFloat = (5.0 * scale + idleBreath * scale) + dynamicWave
 
-            // 0. 底层柔光氛围微光（弥散光环，呼吸流动）
-            if !isFrameSilent && avgEnergy > 0.02 {
-                let auraW = ribbonWidth * 0.85
-                let auraH = min(baseY * 1.5, max(16 * scale, baseAmp * 2.0))
-                let auraRect = CGRect(x: (canvas.width - auraW) / 2, y: baseY - auraH / 2, width: auraW, height: auraH)
-                ctx.saveGState()
-                ctx.setFillColor(highlightColor.withAlphaComponent(0.22 * avgEnergy).cgColor)
-                ctx.fillEllipse(in: auraRect)
-                ctx.restoreGState()
-            }
+            // 动态透明度无级映射：无声/静音时为 20%，声音最大时为 80%，随音量能量平滑无级过渡
+            let speechAlpha: CGFloat = 0.20 + normEnergy * (0.80 - 0.20)
 
             // 辅助：生成单条多项式缓动正弦波点集
-            let maxDownwardExcursion = baseY - 4.0 * scale
+            let maxDownwardExcursion = max(18.0 * scale, baseAmp * 1.5)
             func computeWavePoints(freq1: Double, freq2: Double, freq3: Double, speed: Double, phaseOffset: Double, ampFactor: CGFloat) -> [CGPoint] {
                 var pts: [CGPoint] = []
                 pts.reserveCapacity(points)
@@ -1815,41 +1817,51 @@ public final class VideoRenderer: @unchecked Sendable {
             let auxColor1 = NSColor(calibratedRed: min(1.0, baseRGB.redComponent * 0.4 + 0.30),
                                     green: min(1.0, baseRGB.greenComponent * 0.6 + 0.35),
                                     blue: min(1.0, baseRGB.blueComponent * 0.3 + 0.95),
-                                    alpha: speechAlpha * 0.65)
+                                    alpha: 1.0)
             let auxColor2 = NSColor(calibratedRed: min(1.0, baseRGB.redComponent * 0.9 + 0.10),
                                     green: min(1.0, baseRGB.greenComponent * 0.4 + 0.40),
                                     blue: min(1.0, baseRGB.blueComponent * 0.8 + 0.20),
-                                    alpha: speechAlpha * 0.78)
+                                    alpha: 1.0)
 
-            // 层 1：外围深邃极光反相光带（宽幅柔和）
-            let pts1 = computeWavePoints(freq1: 2.4, freq2: 3.8, freq3: 5.4, speed: 2.2, phaseOffset: .pi * 0.6, ampFactor: 0.70)
+            // 线 1 (远景·天青/深邃极光反相光带，虚化柔和，11% -> 44%)
+            let pts1 = computeWavePoints(freq1: 1.6, freq2: 2.8, freq3: 4.4, speed: 1.8, phaseOffset: 0.0, ampFactor: 0.65)
             let path1 = makeSmoothPath(from: pts1)
-            ctx.setLineWidth(max(2.2, 3.4 * scale))
-            ctx.setStrokeColor(auxColor1.cgColor)
+            ctx.setLineWidth(max(2.6, 3.6 * scale))
+            ctx.setStrokeColor(auxColor1.withAlphaComponent(speechAlpha * 0.55).cgColor)
             ctx.addPath(path1)
             ctx.strokePath()
 
-            // 层 2：次级高频谐波光带（灵动交错）
-            let pts2 = computeWavePoints(freq1: 3.2, freq2: 2.2, freq3: 5.8, speed: -2.6, phaseOffset: .pi * 1.25, ampFactor: 0.85)
+            // 线 2 (次远景·紫晶/高频灵动光带，轻盈通透，14% -> 58%)
+            let pts2 = computeWavePoints(freq1: 2.4, freq2: 3.8, freq3: 5.2, speed: -2.4, phaseOffset: .pi * 0.45, ampFactor: 0.78)
             let path2 = makeSmoothPath(from: pts2)
-            ctx.setLineWidth(max(2.6, 4.0 * scale))
-            ctx.setStrokeColor(auxColor2.cgColor)
+            ctx.setLineWidth(max(2.4, 3.4 * scale))
+            ctx.setStrokeColor(auxColor2.withAlphaComponent(speechAlpha * 0.72).cgColor)
             ctx.addPath(path2)
             ctx.strokePath()
 
-            // 层 3：主光波霓虹外发光（Glow Core）
-            let ptsMain = computeWavePoints(freq1: 2.0, freq2: 3.0, freq3: 4.5, speed: 3.2, phaseOffset: 0.0, ampFactor: 1.0)
-            let pathMain = makeSmoothPath(from: ptsMain)
-            ctx.setLineWidth(max(4.0, 6.2 * scale))
-            ctx.setStrokeColor(highlightColor.withAlphaComponent(speechAlpha * 0.85).cgColor)
-            ctx.addPath(pathMain)
+            // 线 3 (中景·低频共鸣主光带，深沉主题，17% -> 70%)
+            let pts3 = computeWavePoints(freq1: 2.0, freq2: 3.0, freq3: 4.2, speed: 2.8, phaseOffset: .pi * 0.90, ampFactor: 0.92)
+            let path3 = makeSmoothPath(from: pts3)
+            ctx.setLineWidth(max(3.0, 4.4 * scale))
+            ctx.setStrokeColor(highlightColor.withAlphaComponent(speechAlpha * 0.88).cgColor)
+            ctx.addPath(path3)
             ctx.strokePath()
 
-            // 层 4：主光波璀璨晶亮核心束（高透亮白激光核，确保极度清晰锐利）
+            // 线 4 (近景·清澈高频主光带，明亮主题，18% -> 74%)
+            let pts4 = computeWavePoints(freq1: 2.8, freq2: 1.8, freq3: 4.8, speed: -3.2, phaseOffset: .pi * 1.35, ampFactor: 0.96)
+            let path4 = makeSmoothPath(from: pts4)
+            ctx.setLineWidth(max(2.8, 4.0 * scale))
+            ctx.setStrokeColor(highlightColor.withAlphaComponent(speechAlpha * 0.92).cgColor)
+            ctx.addPath(path4)
+            ctx.strokePath()
+
+            // 线 5 (焦点·纯白晶莹激光核心束，顶级锐利焦点，20% -> 80%)
+            let pts5 = computeWavePoints(freq1: 3.6, freq2: 2.4, freq3: 5.6, speed: 3.6, phaseOffset: .pi * 1.80, ampFactor: 0.85)
+            let path5 = makeSmoothPath(from: pts5)
             ctx.setLineWidth(max(1.8, 2.8 * scale))
-            let coreColor = NSColor.white.withAlphaComponent(isFrameSilent ? 0.45 : 0.98)
+            let coreColor = NSColor.white.withAlphaComponent(speechAlpha * 1.00)
             ctx.setStrokeColor(coreColor.cgColor)
-            ctx.addPath(pathMain)
+            ctx.addPath(path5)
             ctx.strokePath()
 
             ctx.restoreGState()
