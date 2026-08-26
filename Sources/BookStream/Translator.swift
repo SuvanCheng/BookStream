@@ -64,13 +64,32 @@ public struct TranslationSettings: Codable, Equatable, Sendable {
     }
 }
 
-// MARK: - 智能双语翻译引擎（上下文批处理 + 结构化 JSON 强校验）
+// MARK: - 翻译 Token 与 Context Caching 统计结构体
+
+public struct TranslationUsage: Sendable {
+    public var promptTokens: Int = 0
+    public var completionTokens: Int = 0
+    public var cacheHitTokens: Int = 0
+    public var cacheMissTokens: Int = 0
+    public var totalTokens: Int { promptTokens + completionTokens }
+
+    public mutating func add(prompt: Int, completion: Int, hit: Int, miss: Int) {
+        promptTokens += prompt
+        completionTokens += completion
+        cacheHitTokens += hit
+        cacheMissTokens += miss
+    }
+}
+
+// MARK: - 智能双语翻译引擎（上下文批处理 + 结构化 JSON 强校验 + Context Caching 深度优化）
 
 public enum Translator {
 
-    /// 批量翻译整本书籍的句子列表（保持上下文连贯与严格 1-to-1 映射，支持断网重连与状态汇报）
+    /// 批量翻译整本书籍的句子列表（支持本地存档秒级恢复、增量实时安全落盘、智能自然边界分批、书籍背景注入、断网重连、Token与缓存统计及状态汇报）
     public static func translateBook(
         sentences: [Sentence],
+        bookFileURL: URL? = nil,
+        bookTitle: String? = nil,
         settings: TranslationSettings,
         onProgress: (@Sendable (Int, Int) -> Void)? = nil,
         onStatus: (@Sendable (String) -> Void)? = nil,
@@ -79,11 +98,23 @@ public enum Translator {
         guard !sentences.isEmpty else { return [] }
         if cancellation?() == true { throw BookStreamError.cancelled }
 
-        var resultSentences = sentences
+        let title = bookTitle ?? bookFileURL?.deletingPathExtension().lastPathComponent ?? "book"
 
-        // 过滤出需要翻译的英文句子索引（已自带翻译的跳过）
+        // 1. 尝试从本地持久化存档中秒级恢复已有译文（节省 100% 重复 Token）
+        let (initialSentences, restoredCount, cpURL) = restoreFromCheckpoint(
+            sentences: sentences,
+            bookFileURL: bookFileURL,
+            bookTitle: title
+        )
+        var resultSentences = initialSentences
+
+        if restoredCount > 0 {
+            onStatus?("💡 已自动匹配并加载本地翻译存档（\(cpURL?.lastPathComponent ?? "translation.json")，已恢复 \(restoredCount)/\(sentences.count) 句）")
+        }
+
+        // 2. 过滤出需要翻译的英文句子索引（已自带或已从存档恢复翻译的跳过）
         var toTranslateIndices: [Int] = []
-        for (i, s) in sentences.enumerated() {
+        for (i, s) in resultSentences.enumerated() {
             let tr = s.translation?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if tr.isEmpty && TextProcessor.isPrimarilyEnglish(s.text) {
                 toTranslateIndices.append(i)
@@ -96,50 +127,115 @@ public enum Translator {
         }
 
         let total = toTranslateIndices.count
-        let batchSize = 16 // 每次 16 句（既能保持充分的上下文连贯，又兼顾速度与稳定性）
+        let batchSize = 16 // 目标批次容量（兼顾上下文连贯与稳定性）
 
+        var totalUsage = TranslationUsage()
         var cursor = 0
         while cursor < total {
             if cancellation?() == true { throw BookStreamError.cancelled }
 
-            let end = min(cursor + batchSize, total)
+            // 智能段落与对话边界对齐：在 [cursor+12 .. cursor+20] 范围内寻找自然句末/引号闭合边界，避免在对话正中生硬截断
+            var end = min(cursor + batchSize, total)
+            if end < total {
+                let minEnd = min(cursor + 12, total)
+                let maxEnd = min(cursor + 20, total)
+                for candidate in stride(from: maxEnd, through: minEnd, by: -1) {
+                    let sentIdx = toTranslateIndices[candidate - 1]
+                    let txt = sentences[sentIdx].text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if txt.hasSuffix(".") || txt.hasSuffix("?") || txt.hasSuffix("!") || txt.hasSuffix("\"") || txt.hasSuffix("”") {
+                        end = candidate
+                        break
+                    }
+                }
+            }
+
             let batchIndices = Array(toTranslateIndices[cursor..<end])
             let batchItems = batchIndices.map { idx in
                 (id: idx, text: sentences[idx].text)
             }
 
+            // 提取前序 2~3 句已翻译好的中英文作为「前情上下文参考」，确保跨批次专有名词、人名、代词与语气高度一致
+            var contextHistory: [(en: String, zh: String)] = []
+            if cursor > 0 {
+                let startHistory = max(0, cursor - 3)
+                for prevIdx in toTranslateIndices[startHistory..<cursor] {
+                    if let zh = resultSentences[prevIdx].translation, !zh.isEmpty {
+                        contextHistory.append((en: sentences[prevIdx].text, zh: zh))
+                    }
+                }
+            }
+
             // 翻译该批次
-            let translations = try await translateBatch(
+            let (translations, usage) = try await translateBatch(
                 items: batchItems,
+                bookTitle: title,
+                contextHistory: contextHistory,
                 settings: settings,
                 onStatus: onStatus,
                 cancellation: cancellation
             )
+
+            if let u = usage {
+                totalUsage.add(prompt: u.promptTokens, completion: u.completionTokens, hit: u.cacheHitTokens, miss: u.cacheMissTokens)
+            }
 
             // 回填译文
             for (idx, zh) in translations {
                 resultSentences[idx].translation = zh
             }
 
+            // 3. 游戏级实时增量存档落盘（无论后续发生何种情况，已翻译好的句子 100% 稳妥保存在磁盘）
+            saveCheckpoint(
+                sentences: resultSentences,
+                bookFileURL: bookFileURL,
+                bookTitle: title
+            )
+
             cursor = end
             onProgress?(cursor, total)
+        }
+
+        // 4. 翻译全部完成，同步导出易读的双语对照文本 (.bilingual.txt)
+        if let fileURL = bookFileURL {
+            let bilingualTxtURL = fileURL.deletingPathExtension().appendingPathExtension("bilingual.txt")
+            try? exportBilingualText(sentences: resultSentences, to: bilingualTxtURL)
+        }
+
+        // 汇报整体 Token 消耗与 Context Caching 命中率
+        if totalUsage.totalTokens > 0 {
+            let hitTokens = totalUsage.cacheHitTokens
+            let missTokens = totalUsage.cacheMissTokens
+            let totalPrompt = (hitTokens + missTokens > 0) ? (hitTokens + missTokens) : totalUsage.promptTokens
+            let hitRatio = totalPrompt > 0 ? (Double(hitTokens) / Double(totalPrompt) * 100.0) : 0.0
+
+            if settings.provider == .deepseek {
+                // DeepSeek 官方定价: 命中 0.1元/1M, 未命中 1.0元/1M, 输出 2.0元/1M
+                let cost = (Double(hitTokens) * 0.1 + Double(missTokens) * 1.0 + Double(totalUsage.completionTokens) * 2.0) / 1_000_000.0
+                let costStr = cost < 0.01 ? String(format: "%.4f", cost) : String(format: "%.2f", cost)
+                onStatus?("💡 DeepSeek Token 统计: 输入 \(totalPrompt) (缓存命中 \(hitTokens) · \(String(format: "%.1f", hitRatio))% 命中率 · 享 1 折优惠) + 输出 \(totalUsage.completionTokens) · 预估费用约 ¥\(costStr)")
+            } else {
+                onStatus?("💡 翻译 Token 统计: 输入 \(totalUsage.promptTokens) + 输出 \(totalUsage.completionTokens) · 总计 \(totalUsage.totalTokens) tokens")
+            }
         }
 
         return resultSentences
     }
 
-    /// 单批次结构化翻译（带断网等待重连、指数退避重试与兜底容错）
+    /// 单批次结构化翻译（带书籍背景、前情上下文滑动窗口、断网等待重连、指数退避重试、Token使用量与缓存提取与兜底容错）
     private static func translateBatch(
         items: [(id: Int, text: String)],
+        bookTitle: String? = nil,
+        contextHistory: [(en: String, zh: String)] = [],
         settings: TranslationSettings,
         onStatus: (@Sendable (String) -> Void)? = nil,
         cancellation: (@Sendable () -> Bool)? = nil
-    ) async throws -> [Int: String] {
-        guard !items.isEmpty else { return [:] }
+    ) async throws -> (translations: [Int: String], usage: TranslationUsage?) {
+        guard !items.isEmpty else { return ([:], nil) }
         if cancellation?() == true { throw BookStreamError.cancelled }
 
         if settings.provider == .builtInFree {
-            return try await translateBatchFree(items: items, cancellation: cancellation)
+            let res = try await translateBatchFree(items: items, cancellation: cancellation)
+            return (res, nil)
         }
 
         // 构建 OpenAI 兼容格式上下文 Prompt
@@ -147,8 +243,8 @@ public enum Translator {
         你是一位精通英汉文学翻译的国宝级翻译大师。
         请将输入的连续英文句子数组翻译为典雅、地道、信达雅的中文。
         要求：
-        1. 结合前后上下文连贯理解，保持专有名词、人名、地名、代词的前后一致性。
-        2. 严格按输入中的 id 映射，绝不要漏句、合并句子或改变 id 顺序。
+        1. 结合前后上下文连贯理解，严格保持专有名词、人名、地名、代词指代及叙事语气的前后一致性（如提供前情上下文，请严格沿用前文的人物译名与行文口吻）。
+        2. 严格按待翻译数组中的 id 映射，绝不要漏句、合并句子、改变 id 顺序，也不要输出前情参考中的句子。
         3. 必须且仅输出严格合法的 JSON 数组，格式例如：
         [{"id": 0, "zh": "译文..."}, {"id": 1, "zh": "译文..."}]
         """
@@ -157,7 +253,18 @@ public enum Translator {
         let inputJsonData = try JSONSerialization.data(withJSONObject: inputJsonArray)
         let inputJsonString = String(data: inputJsonData, encoding: .utf8) ?? "[]"
 
-        let userPrompt = "待翻译句子数组如下，请输出翻译 JSON 数组：\n\(inputJsonString)"
+        var userPrompt = ""
+        if let title = bookTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
+            userPrompt += "【作品背景】《\(title)》\n\n"
+        }
+        if !contextHistory.isEmpty {
+            let historyJsonArray = contextHistory.map { ["en": $0.en, "zh": $0.zh] }
+            if let histData = try? JSONSerialization.data(withJSONObject: historyJsonArray),
+               let histStr = String(data: histData, encoding: .utf8) {
+                userPrompt += "【前情上下文参考（仅供保持人名/地名/代词与语气连贯，无需重复翻译）：】\n\(histStr)\n\n"
+            }
+        }
+        userPrompt += "【本次待翻译句子数组（请严格输出对应 id 的中文翻译 JSON 数组）：】\n\(inputJsonString)"
 
         var requestBody: [String: Any] = [
             "model": settings.model.isEmpty ? settings.provider.defaultModel : settings.model,
@@ -208,14 +315,27 @@ public enum Translator {
                     }
                 }
 
-                // 解析返回 JSON
+                // 解析返回 JSON 与 Token Usage
                 var resultMap: [Int: String] = [:]
-                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let choices = json["choices"] as? [[String: Any]],
-                   let first = choices.first,
-                   let msg = first["message"] as? [String: Any],
-                   let content = msg["content"] as? String {
-                    resultMap = parseTranslationJSON(content)
+                var usageStats: TranslationUsage? = nil
+
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    if let choices = json["choices"] as? [[String: Any]],
+                       let first = choices.first,
+                       let msg = first["message"] as? [String: Any],
+                       let content = msg["content"] as? String {
+                        resultMap = parseTranslationJSON(content)
+                    }
+
+                    if let usage = json["usage"] as? [String: Any] {
+                        let pTokens = (usage["prompt_tokens"] as? Int) ?? 0
+                        let cTokens = (usage["completion_tokens"] as? Int) ?? 0
+                        let hitTokens = (usage["prompt_cache_hit_tokens"] as? Int) ?? 0
+                        let missTokens = (usage["prompt_cache_miss_tokens"] as? Int) ?? 0
+                        var u = TranslationUsage()
+                        u.add(prompt: pTokens, completion: cTokens, hit: hitTokens, miss: missTokens)
+                        usageStats = u
+                    }
                 }
 
                 // 校验是否所有 item 都有对应翻译；如有缺失，单句补充兜底
@@ -227,7 +347,7 @@ public enum Translator {
                     }
                 }
 
-                return resultMap
+                return (resultMap, usageStats)
             } catch {
                 if cancellation?() == true || (error as? BookStreamError) == .cancelled {
                     throw BookStreamError.cancelled
@@ -481,10 +601,130 @@ public enum Translator {
     /// 测试连接与翻译质量
     public static func testConnection(settings: TranslationSettings) async throws -> String {
         let testSentence = (id: 0, text: "It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want of a wife.")
-        let res = try await translateBatch(items: [testSentence], settings: settings)
+        let (res, _) = try await translateBatch(items: [testSentence], settings: settings)
         guard let zh = res[0], !zh.isEmpty else {
             throw BookStreamError.audioRenderFailed("未收到有效翻译返回")
         }
         return zh
+    }
+
+    // MARK: - 翻译存档与断点续译管理 (Translation Checkpoints)
+
+    /// 获取书籍对应的存档文件路径（优先就近保存在书籍同级目录，回退保存在 ~/.bookstream/translations/）
+    public static func getCheckpointURL(bookFileURL: URL?, bookTitle: String) -> URL {
+        let safeTitle = bookTitle.components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-")).inverted).joined(separator: "_")
+        let fileName = safeTitle.isEmpty ? "unnamed.translation.json" : "\(safeTitle).translation.json"
+
+        if let fileURL = bookFileURL {
+            let companion = fileURL.deletingPathExtension().appendingPathExtension("translation.json")
+            return companion
+        }
+
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let cacheDir = home.appendingPathComponent(".bookstream/translations")
+        try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        return cacheDir.appendingPathComponent(fileName)
+    }
+
+    /// 从本地存档自动恢复已有翻译（秒级复用，节省 100% 重复 Token）
+    public static func restoreFromCheckpoint(
+        sentences: [Sentence],
+        bookFileURL: URL? = nil,
+        bookTitle: String? = nil
+    ) -> (sentences: [Sentence], restoredCount: Int, checkpointURL: URL?) {
+        let title = bookTitle ?? bookFileURL?.deletingPathExtension().lastPathComponent ?? "book"
+        let cpURL = getCheckpointURL(bookFileURL: bookFileURL, bookTitle: title)
+
+        // 尝试从就近同名存档或全局备份存档加载
+        var loadedData: Data? = nil
+        if FileManager.default.fileExists(atPath: cpURL.path) {
+            loadedData = try? Data(contentsOf: cpURL)
+        } else {
+            let home = FileManager.default.homeDirectoryForCurrentUser
+            let backupURL = home.appendingPathComponent(".bookstream/translations/\(cpURL.lastPathComponent)")
+            if FileManager.default.fileExists(atPath: backupURL.path) {
+                loadedData = try? Data(contentsOf: backupURL)
+            }
+        }
+
+        guard let data = loadedData,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let translations = json["translations"] as? [String: String] else {
+            return (sentences, 0, nil)
+        }
+
+        var result = sentences
+        var count = 0
+        for i in 0..<result.count {
+            if result[i].translation?.isEmpty ?? true {
+                let key = result[i].text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let zh = translations[key], !zh.isEmpty {
+                    result[i].translation = zh
+                    count += 1
+                }
+            } else {
+                count += 1
+            }
+        }
+
+        return (result, count, cpURL)
+    }
+
+    /// 增量实时保存翻译存档（每批次自动落盘，实现游戏级安全存档与断点续译）
+    public static func saveCheckpoint(
+        sentences: [Sentence],
+        bookFileURL: URL? = nil,
+        bookTitle: String? = nil
+    ) {
+        let title = bookTitle ?? bookFileURL?.deletingPathExtension().lastPathComponent ?? "book"
+        let cpURL = getCheckpointURL(bookFileURL: bookFileURL, bookTitle: title)
+
+        var map: [String: String] = [:]
+        var completed = 0
+        for s in sentences {
+            if let zh = s.translation?.trimmingCharacters(in: .whitespacesAndNewlines), !zh.isEmpty {
+                let key = s.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                map[key] = zh
+                completed += 1
+            }
+        }
+
+        guard completed > 0 else { return }
+
+        let payload: [String: Any] = [
+            "bookTitle": title,
+            "version": "1.0",
+            "updatedAt": ISO8601DateFormatter().string(from: Date()),
+            "totalSentences": sentences.count,
+            "completedSentences": completed,
+            "translations": map
+        ]
+
+        if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: cpURL, options: .atomic)
+
+            // 同时向 ~/.bookstream/translations 做一份全局安全备份
+            let home = FileManager.default.homeDirectoryForCurrentUser
+            let backupDir = home.appendingPathComponent(".bookstream/translations")
+            try? FileManager.default.createDirectory(at: backupDir, withIntermediateDirectories: true)
+            let backupURL = backupDir.appendingPathComponent(cpURL.lastPathComponent)
+            try? data.write(to: backupURL, options: .atomic)
+        }
+    }
+
+    /// 导出精美可读的双语对照纯文本文档 (.bilingual.txt)
+    public static func exportBilingualText(
+        sentences: [Sentence],
+        to fileURL: URL
+    ) throws {
+        var content = ""
+        for (i, s) in sentences.enumerated() {
+            content += "\(i + 1). [EN] \(s.text)\n"
+            if let zh = s.translation, !zh.isEmpty {
+                content += "   [ZH] \(zh)\n"
+            }
+            content += "\n"
+        }
+        try content.write(to: fileURL, atomically: true, encoding: .utf8)
     }
 }

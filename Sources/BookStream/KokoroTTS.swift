@@ -145,6 +145,12 @@ public final class KokoroTTS: @unchecked Sendable {
             "--batch-json", inJson.path,
             "--output-json", outJson.path
         ]
+        var env = ProcessInfo.processInfo.environment
+        env["ORT_TELEMETRY_OPTOUT"] = "1"
+        env["ORT_DISABLE_TELEMETRY"] = "1"
+        env["OMP_NUM_THREADS"] = "1"
+        env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+        process.environment = env
 
         let pipe = Pipe()
         process.standardError = pipe
@@ -185,8 +191,57 @@ public final class KokoroTTS: @unchecked Sendable {
         return buffers
     }
 
-    /// 批量极速合成：单次启动 Python 进程，复用内存中已加载的 ONNX 模型与 G2P 实例（速度提升 10x-15x）
+    /// 批量极速合成：支持超长全本动态分块（100句/块），单次启动 Python 进程复用内存模型，彻底杜绝单进程超大负载崩溃
     public func renderBatch(
+        texts: [String],
+        voice: String,
+        rate: Float,
+        onProgress: (@Sendable (Int, Int) -> Void)? = nil,
+        cancellation: (@Sendable () -> Bool)? = nil
+    ) throws -> [[AVAudioPCMBuffer]] {
+        guard !texts.isEmpty else { return [] }
+        if cancellation?() == true { throw BookStreamError.cancelled }
+
+        let chunkSize = 100
+        if texts.count <= chunkSize {
+            return try renderBatchInternal(
+                texts: texts,
+                voice: voice,
+                rate: rate,
+                onProgress: onProgress,
+                cancellation: cancellation
+            )
+        }
+
+        var allResults: [[AVAudioPCMBuffer]] = []
+        allResults.reserveCapacity(texts.count)
+        var cursor = 0
+
+        while cursor < texts.count {
+            if cancellation?() == true { throw BookStreamError.cancelled }
+            let end = min(cursor + chunkSize, texts.count)
+            let chunkTexts = Array(texts[cursor..<end])
+            let baseOffset = cursor
+
+            let chunkResults = try renderBatchInternal(
+                texts: chunkTexts,
+                voice: voice,
+                rate: rate,
+                onProgress: { done, _ in
+                    onProgress?(baseOffset + done, texts.count)
+                },
+                cancellation: cancellation
+            )
+
+            allResults.append(contentsOf: chunkResults)
+            cursor = end
+        }
+
+        return allResults
+    }
+
+    /// 单块批量合成（单进程批处理）
+    private func renderBatchInternal(
         texts: [String],
         voice: String,
         rate: Float,
@@ -230,6 +285,12 @@ public final class KokoroTTS: @unchecked Sendable {
             "--batch-json", inJson.path,
             "--output-json", outJson.path
         ]
+        var env = ProcessInfo.processInfo.environment
+        env["ORT_TELEMETRY_OPTOUT"] = "1"
+        env["ORT_DISABLE_TELEMETRY"] = "1"
+        env["OMP_NUM_THREADS"] = "1"
+        env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+        process.environment = env
 
         let outPipe = Pipe()
         let errPipe = Pipe()

@@ -98,12 +98,8 @@ public final class AudioEngine: @unchecked Sendable {
             do { box.result = try work() } catch { box.error = error }
             semaphore.signal()
         }
-        // 有界等待：音频线程内部已有 10 分钟看门狗，此处 90 分钟兜底，
-        // 避免任何意外情况下调用方无限阻塞。长书（数万句）AI 批量合成整体耗时可能很长，
-        // 但逐句内部有 10 分钟看门狗，不会真正挂死。
-        if semaphore.wait(timeout: .now() + 5400) == .timedOut {
-            throw BookStreamError.audioRenderFailed("音频线程任务超时（90 分钟）")
-        }
+        // 支持巨著级长篇有声书（数万句 / 10+ 小时）持续离线合成；用户可随时通过 UI 一键取消中断
+        semaphore.wait()
         if let error = box.error { throw error }
         guard let result = box.result else {
             throw BookStreamError.audioRenderFailed("音频线程未返回结果")

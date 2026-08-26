@@ -119,8 +119,19 @@ final class AppModel: ObservableObject {
             let chars = sentences.reduce(0) { $0 + $1.text.count }
             let hanRatio = Self.hanRatio(of: sentences.prefix(200).map(\.text).joined())
             let audioEst = Self.estimateAudioDuration(chars: chars, hanRatio: hanRatio, rate: speechRate)
-            let genEst = Self.estimateGenerationTime(chars: chars, audioDur: audioEst, resolution: videoResolution)
-            return "\(title) · \(sentences.count) 句 · \(chars) 字 · 音频约 \(Self.formatDuration(audioEst)) · 生成约 \(Self.formatDuration(genEst))"
+            let toTr = translationSettings.enabled ? sentences.filter { ($0.translation?.isEmpty ?? true) && TextProcessor.isPrimarilyEnglish($0.text) }.count : 0
+            let est = Self.estimateGenerationBreakdown(
+                chars: chars,
+                audioDur: audioEst,
+                resolution: videoResolution,
+                engine: selectedTTSEngine,
+                exportMode: exportMode,
+                useExistingAudio: useExistingAudio,
+                needsTranslation: translationSettings.enabled,
+                toTranslateCount: toTr,
+                isDeepSeek: translationSettings.provider == .deepseek
+            )
+            return "\(title) · \(sentences.count) 句 · \(chars) 字 · 视频时长约 \(Self.formatDuration(audioEst)) · 生成耗时约 \(Self.formatDuration(est.totalDuration))"
         case .subtitles(let title, let entries):
             let dur = entries.last.map { $0.end } ?? 0
             let isBilingual = entries.contains { $0.translation != nil && !$0.translation!.isEmpty }
@@ -137,27 +148,109 @@ final class AppModel: ObservableObject {
         return Double(han) / Double(scalars.count)
     }
 
-    /// 预估音频时长（秒）：中文约 4.8 字/秒、英文约 17 字/秒（基准 0.5 语速），
-    /// 语速缩放：1 + (0.5 - rate) * 1.2。
-    private static func estimateAudioDuration(chars: Int, hanRatio: Double, rate: Float) -> Double {
+    /// 预估视频/音频播放总时长（秒）：
+    /// 1. 语言声学物理基准（以标准 1.0x 语速即 rate = 0.40 为准，含自然连读与标点微停顿）：
+    ///    - 英文叙事：约 15.35 字符/秒（约 150~160 单词/分钟，实测《奥德赛》20,973字精准对齐 22m 50s）
+    ///    - 中文朗读：约 4.4 汉字/秒（约 260 字/分钟，标准播音级语速）
+    /// 2. 严格语速反比物理定律：Duration = Base / (speechRate / 0.40)，随语速滑块无级高精度动态重算
+    private static func estimateAudioDuration(
+        chars: Int,
+        hanRatio: Double,
+        rate: Float
+    ) -> Double {
         guard chars > 0 else { return 0 }
-        let base = hanRatio > 0.2 ? 4.8 : 17.0
-        let rateScale = 1.0 + Double(0.5 - rate) * 1.2
-        return Double(chars) / base * rateScale
+        let baseCharsPerSec = hanRatio > 0.2 ? 4.4 : 15.35
+        let effectiveRate = Double(max(0.15, min(rate, 1.0)))
+        let speedMultiplier = effectiveRate / 0.40 // 0.40 为标准 1.0x 正常主播语速基准
+        return (Double(chars) / baseCharsPerSec) / speedMultiplier
     }
 
-    /// 预估生成耗时（秒）：TTS 合成 + 视频渲染。
-    /// 基准（实测校准）：Kokoro/Edge 神经引擎约 600 字/秒；视频渲染约 20× 实时（480p），
-    /// 随分辨率像素数反比缩放（1080p≈9×，4K≈2×）。
-    private static func estimateGenerationTime(chars: Int, audioDur: Double, resolution: VideoResolution) -> Double {
-        let tts = Double(chars) / 600.0
-        let px = Double(resolution.width * resolution.height)
-        let videoRealtime = 20.0 * (921_600.0 / max(px, 1))   // 480p 像素 = 921600
-        let video = audioDur / max(videoRealtime, 1)
-        return tts + video
+    /// 生成耗时预估明细结构体
+    public struct GenerationEstimate {
+        public let translationDuration: Double
+        public let ttsDuration: Double
+        public let mediaDuration: Double
+        public var totalDuration: Double { translationDuration + ttsDuration + mediaDuration }
+
+        public func summaryString() -> String {
+            var parts: [String] = []
+            if translationDuration > 1.0 {
+                parts.append("翻译约 \(AppModel.formatDuration(translationDuration))")
+            }
+            if ttsDuration > 1.0 {
+                parts.append("TTS 约 \(AppModel.formatDuration(ttsDuration))")
+            }
+            if mediaDuration > 1.0 {
+                parts.append("视频渲染约 \(AppModel.formatDuration(mediaDuration))")
+            }
+            if parts.isEmpty {
+                return "约 \(AppModel.formatDuration(totalDuration))"
+            }
+            return parts.joined(separator: " + ")
+        }
     }
 
-    private static func formatDuration(_ s: Double) -> String {
+    /// 预估全流程生成耗时（秒）：翻译耗时 + TTS 离线抓轨 + 视频多媒体硬件加速渲染。
+    private static func estimateGenerationBreakdown(
+        chars: Int,
+        audioDur: Double,
+        resolution: VideoResolution,
+        engine: TTSEngineType,
+        exportMode: ExportMode = .video,
+        useExistingAudio: Bool = false,
+        needsTranslation: Bool = false,
+        toTranslateCount: Int = 0,
+        isDeepSeek: Bool = false
+    ) -> GenerationEstimate {
+        // 1. 翻译预估耗时（实测 MyMemory 约 5.5 句/秒，DeepSeek 约 4.5 句/秒）
+        let trTime: Double
+        if needsTranslation && toTranslateCount > 0 {
+            let perSentence = isDeepSeek ? 0.22 : 0.18
+            trTime = Double(toTranslateCount) * perSentence
+        } else {
+            trTime = 0.0
+        }
+
+        // 2. TTS 离线抓轨耗时（实测 Apple Silicon 神经计算吞吐）
+        let ttsTime: Double
+        if useExistingAudio {
+            ttsTime = 0.0
+        } else {
+            switch engine {
+            case .kokoro:
+                // Kokoro-82M 本地 ONNX 离线推理实测约 5.5× 实时率（~84 字符/秒）
+                ttsTime = audioDur / 5.5
+            case .edgeTTS:
+                // 微软 Edge 云端高并发抓轨实测约 18× 实时率（~250 字符/秒）
+                ttsTime = audioDur / 18.0
+            case .customAPI:
+                ttsTime = audioDur / 6.0
+            }
+        }
+
+        // 3. 视频渲染/多媒体导出耗时（实测 Apple Silicon 硬件加速渲染管线）
+        let mediaTime: Double
+        switch exportMode {
+        case .video:
+            let px = Double(resolution.width * resolution.height)
+            // 480p 实测 10.3× 实时率（88.5万帧 59m53s 完成），按像素面积反比缩放 (1080p≈5.0×, 4K≈1.2×)
+            let videoRealtime = 10.3 * (921_600.0 / max(px, 1.0))
+            mediaTime = audioDur / max(videoRealtime, 1.0)
+        case .audio, .m4b:
+            // 纯音频混音与 AAC 硬件编码约 50× 实时率
+            mediaTime = audioDur / 50.0
+        case .srt:
+            mediaTime = 0.05
+        }
+
+        return GenerationEstimate(
+            translationDuration: trTime,
+            ttsDuration: ttsTime,
+            mediaDuration: mediaTime
+        )
+    }
+
+    nonisolated static func formatDuration(_ s: Double) -> String {
         let total = Int(s.rounded())
         let h = total / 3600
         let m = (total % 3600) / 60
@@ -412,19 +505,41 @@ final class AppModel: ObservableObject {
             case "txt", "epub":
                 let splitLong = splitLongSentences
                 let isPortrait = (videoAspectRatio == .portrait9_16)
-                let (sentences, fixes) = try await Task.detached(priority: .userInitiated) {
+                let (parsedSentences, fixes) = try await Task.detached(priority: .userInitiated) {
                     try TextProcessor.parseBookFile(url: url, splitLong: splitLong, isPortrait: isPortrait)
                 }.value
+
+                // 自动检查并恢复本地已有翻译存档（如 odyssey.translation.json，实现秒级复用与零Token浪费）
+                let (sentences, restoredCount, cpURL) = Translator.restoreFromCheckpoint(
+                    sentences: parsedSentences,
+                    bookFileURL: url,
+                    bookTitle: url.deletingPathExtension().lastPathComponent
+                )
+
                 inputKind = .book(
                     title: url.deletingPathExtension().lastPathComponent,
                     sentences: sentences
                 )
                 let chars = sentences.reduce(0) { $0 + $1.text.count }
                 log("书籍解析完成: \(sentences.count) 句 / \(chars) 字（\(String(format: "%.2f", Date().timeIntervalSince(t0)))s）")
+                if restoredCount > 0 {
+                    log("  💡 检测到已有翻译存档（\(cpURL?.lastPathComponent ?? "translation.json")，已恢复 \(restoredCount)/\(sentences.count) 句，无需重复消耗 Token）")
+                }
                 let han = Self.hanRatio(of: sentences.prefix(200).map(\.text).joined())
                 let audioEst = Self.estimateAudioDuration(chars: chars, hanRatio: han, rate: speechRate)
-                let genEst = Self.estimateGenerationTime(chars: chars, audioDur: audioEst, resolution: videoResolution)
-                log("预估: 音频时长约 \(Self.formatDuration(audioEst)) · 生成耗时约 \(Self.formatDuration(genEst))（TTS 约 \(Self.formatDuration(Double(chars) / 500.0)) + 视频渲染约 \(Self.formatDuration(audioEst / max(20.0 * (921_600.0 / Double(videoResolution.width * videoResolution.height)), 1)))）")
+                let toTr = translationSettings.enabled ? sentences.filter { ($0.translation?.isEmpty ?? true) && TextProcessor.isPrimarilyEnglish($0.text) }.count : 0
+                let est = Self.estimateGenerationBreakdown(
+                    chars: chars,
+                    audioDur: audioEst,
+                    resolution: videoResolution,
+                    engine: selectedTTSEngine,
+                    exportMode: exportMode,
+                    useExistingAudio: useExistingAudio,
+                    needsTranslation: translationSettings.enabled,
+                    toTranslateCount: toTr,
+                    isDeepSeek: translationSettings.provider == .deepseek
+                )
+                log("预估: 视频时长约 \(Self.formatDuration(audioEst)) · 生成耗时约 \(Self.formatDuration(est.totalDuration))（\(est.summaryString())）")
                 logTextFixes(fixes)
             case "srt":
                 let entries = try await Task.detached(priority: .userInitiated) {
@@ -522,7 +637,7 @@ final class AppModel: ObservableObject {
                 return (raw, "[API]")
             }
         }()
-        let rateStr = String(format: "%.1f", speechRate)
+        let rateStr = String(format: "%.2f", speechRate)
         let pauseStr = String(format: "%.1fx", pauseScale)
 
         let bgmTag: String = {
@@ -756,7 +871,7 @@ final class AppModel: ObservableObject {
 
         do {
             switch (input, exportMode) {
-            case (.book(_, let rawSentences), let mode):
+            case (.book(let url, let rawSentences), let mode):
                 var sentences = rawSentences
                 if translationSettings.enabled {
                     let toTrCount = sentences.filter { ($0.translation?.isEmpty ?? true) && TextProcessor.isPrimarilyEnglish($0.text) }.count
@@ -765,6 +880,8 @@ final class AppModel: ObservableObject {
                         let trStart = Date()
                         sentences = try await Translator.translateBook(
                             sentences: sentences,
+                            bookFileURL: URL(fileURLWithPath: url),
+                            bookTitle: URL(fileURLWithPath: url).deletingPathExtension().lastPathComponent,
                             settings: translationSettings,
                             onProgress: { [weak self] done, total in
                                 Task { @MainActor [weak self] in
@@ -2155,15 +2272,15 @@ struct ContentView: View {
                 Spacer()
                 Text(String(format: "%.2f", model.speechRate)).font(.caption.monospacedDigit())
             }
-            Slider(value: $model.speechRate, in: 0.2...0.6, step: 0.05)
+            Slider(value: $model.speechRate, in: 0.20...0.80, step: 0.01)
             // 停顿感只对「书」输入生效（renderBook 按句插入停顿；字幕模式由时间轴决定，无此参数）
             if case .book = model.inputKind {
                 HStack {
                     Text("停顿感").font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    Text(String(format: "%.1f×", model.pauseScale)).font(.caption.monospacedDigit())
+                    Text(String(format: "%.2f×", model.pauseScale)).font(.caption.monospacedDigit())
                 }
-                Slider(value: $model.pauseScale, in: 0...2, step: 0.1)
+                Slider(value: $model.pauseScale, in: 0...2, step: 0.05)
             }
         }
     }

@@ -633,6 +633,32 @@ enum SelfTest {
             guard bilingualSize > 50_000 else { throw BookStreamError.videoRenderFailed("双语视频过小: \(bilingualSize)") }
             print("BILINGUAL SUBTITLES OK: \(bilingualMp4URL.lastPathComponent), \(bilingualSize) 字节（中英双语·主英文卡拉OK·副中文典雅对齐）")
 
+            // 14) 翻译存档（Checkpoint）与断点续译全流程自检验证
+            let testBookURL = dir.appendingPathComponent("selftest_book.txt")
+            let initialSentences = [
+                Sentence(id: 0, text: "It was the best of times, it was the worst of times.", translation: "那是最好的时代，那是最坏的时代。"),
+                Sentence(id: 1, text: "It was the age of wisdom, it was the age of foolishness.", translation: "那是智慧的时代，那是愚蠢的时代。")
+            ]
+            Translator.saveCheckpoint(sentences: initialSentences, bookFileURL: testBookURL, bookTitle: "selftest_book")
+            let (restored, count, _) = Translator.restoreFromCheckpoint(
+                sentences: [
+                    Sentence(id: 0, text: "It was the best of times, it was the worst of times."),
+                    Sentence(id: 1, text: "It was the age of wisdom, it was the age of foolishness.")
+                ],
+                bookFileURL: testBookURL,
+                bookTitle: "selftest_book"
+            )
+            guard count == 2, restored[0].translation == "那是最好的时代，那是最坏的时代。" else {
+                throw BookStreamError.unsupportedFile("翻译存档恢复失败")
+            }
+            let testBilingualURL = dir.appendingPathComponent("selftest_book.bilingual.txt")
+            try Translator.exportBilingualText(sentences: restored, to: testBilingualURL)
+            let bilingualTxtContent = try String(contentsOf: testBilingualURL, encoding: .utf8)
+            guard bilingualTxtContent.contains("[ZH] 那是最好的时代，那是最坏的时代。") else {
+                throw BookStreamError.unsupportedFile("双语文本导出失败")
+            }
+            print("TRANSLATION CHECKPOINT OK: \(testBookURL.deletingPathExtension().lastPathComponent).translation.json（存档落盘·断点恢复·双语导出全流程验证通过）")
+
             print("SELFTEST PASSED")
         } catch {
             print("SELFTEST FAILED: \(error)")
