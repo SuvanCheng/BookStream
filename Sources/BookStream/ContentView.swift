@@ -129,7 +129,8 @@ final class AppModel: ObservableObject {
                 useExistingAudio: useExistingAudio,
                 needsTranslation: translationSettings.enabled,
                 toTranslateCount: toTr,
-                isDeepSeek: translationSettings.provider == .deepseek
+                isDeepSeek: translationSettings.provider == .deepseek,
+                hasVisualizer: visualizerStyle != .off
             )
             return "\(title) · \(sentences.count) 句 · \(chars) 字 · 视频时长约 \(Self.formatDuration(audioEst)) · 生成耗时约 \(Self.formatDuration(est.totalDuration))"
         case .subtitles(let title, let entries):
@@ -200,7 +201,8 @@ final class AppModel: ObservableObject {
         useExistingAudio: Bool = false,
         needsTranslation: Bool = false,
         toTranslateCount: Int = 0,
-        isDeepSeek: Bool = false
+        isDeepSeek: Bool = false,
+        hasVisualizer: Bool = true
     ) -> GenerationEstimate {
         // 1. 翻译预估耗时（实测 MyMemory 约 5.5 句/秒，DeepSeek 约 4.5 句/秒）
         let trTime: Double
@@ -233,8 +235,9 @@ final class AppModel: ObservableObject {
         switch exportMode {
         case .video:
             let px = Double(resolution.width * resolution.height)
-            // 480p 实测 10.3× 实时率（88.5万帧 59m53s 完成），按像素面积反比缩放 (1080p≈5.0×, 4K≈1.2×)
-            let videoRealtime = 10.3 * (921_600.0 / max(px, 1.0))
+            // 480p 实测：开启 Siri 5条高保真矢量光带动态渲染时约 2.4× 实时率（86.4万帧4h14m完成）；未开启约 10× 实时率
+            let baseRate = hasVisualizer ? 2.4 : 10.0
+            let videoRealtime = baseRate * (921_600.0 / max(px, 1.0))
             mediaTime = audioDur / max(videoRealtime, 1.0)
         case .audio, .m4b:
             // 纯音频混音与 AAC 硬件编码约 50× 实时率
@@ -537,7 +540,8 @@ final class AppModel: ObservableObject {
                     useExistingAudio: useExistingAudio,
                     needsTranslation: translationSettings.enabled,
                     toTranslateCount: toTr,
-                    isDeepSeek: translationSettings.provider == .deepseek
+                    isDeepSeek: translationSettings.provider == .deepseek,
+                    hasVisualizer: visualizerStyle != .off
                 )
                 log("预估: 视频时长约 \(Self.formatDuration(audioEst)) · 生成耗时约 \(Self.formatDuration(est.totalDuration))（\(est.summaryString())）")
                 logTextFixes(fixes)

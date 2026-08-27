@@ -1571,12 +1571,12 @@ public final class VideoRenderer: @unchecked Sendable {
 
     // MARK: - 音频多频段频谱提取
 
-    /// 快速从音频文件提取 60Hz 采样精度的 36 频段对数 FFT 频谱（Accelerate 硬件加速，全书仅耗时 ~0.3s）。
+    /// 快速从音频文件提取 60Hz 采样精度的 36 频段对数 FFT 频谱（流式分块读取，支持 10+ 小时超长巨著，恒定 128KB 内存，Accelerate 硬件加速）。
     /// 包含快速起振（Attack）与平滑重力回落（Decay）动力学，真实呈现低/中/高频的丰富层次与呼吸感。
     private static func extractAudioSpectrum(from url: URL) -> [Float] {
         guard let file = try? AVAudioFile(forReading: url) else { return [] }
         let format = file.processingFormat
-        let totalFrames = AVAudioFrameCount(file.length)
+        let totalFrames = Int(file.length)
         guard totalFrames > 0 else { return [] }
         let sampleRate = Float(format.sampleRate)
 
@@ -1587,7 +1587,7 @@ public final class VideoRenderer: @unchecked Sendable {
 
         let fps: Float = 60.0
         let hopSize = max(1, Int(sampleRate / fps))
-        let numFrames = Int(totalFrames) / hopSize
+        let numFrames = totalFrames / hopSize
         guard numFrames > 0 else { return [] }
         let barCount = 36
 
@@ -1604,10 +1604,6 @@ public final class VideoRenderer: @unchecked Sendable {
 
         var spectrum = [Float](repeating: 0, count: numFrames * barCount)
 
-        guard let fullBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: totalFrames) else { return [] }
-        guard (try? file.read(into: fullBuffer, frameCount: totalFrames)) != nil,
-              let fullChannel = fullBuffer.floatChannelData?[0] else { return [] }
-
         var window = [Float](repeating: 0, count: fftSize)
         vDSP_hann_window(&window, vDSP_Length(fftSize), Int32(vDSP_HANN_NORM))
 
@@ -1617,42 +1613,67 @@ public final class VideoRenderer: @unchecked Sendable {
         var magnitudes = [Float](repeating: 0, count: fftSize / 2)
         var smoothed = [Float](repeating: 0, count: barCount)
 
+        // 采用 32K 帧分块流式读取（仅占用约 128KB 内存），彻底杜绝超长音频单次申请数 GB 内存导致失败返回空频谱
+        let chunkCapacity: AVAudioFrameCount = 32768
+        guard let chunkBuf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkCapacity),
+              let channelPtr = chunkBuf.floatChannelData?[0] else { return [] }
+
+        var history: [Float] = []
+        var frameIndex = 0
+
         realBuffer.withUnsafeMutableBufferPointer { realPtr in
             imagBuffer.withUnsafeMutableBufferPointer { imagPtr in
                 var splitComplex = DSPSplitComplex(realp: realPtr.baseAddress!, imagp: imagPtr.baseAddress!)
 
-                for f in 0..<numFrames {
-                    let offset = f * hopSize
-                    if offset + fftSize > Int(totalFrames) { break }
+                while file.framePosition < file.length && frameIndex < numFrames {
+                    let toRead = min(chunkCapacity, AVAudioFrameCount(file.length - file.framePosition))
+                    guard (try? file.read(into: chunkBuf, frameCount: toRead)) != nil, chunkBuf.frameLength > 0 else { break }
+                    let validChunkFrames = Int(chunkBuf.frameLength)
 
-                    vDSP_vmul(fullChannel + offset, 1, window, 1, &windowed, 1, vDSP_Length(fftSize))
+                    let block = history + Array(UnsafeBufferPointer(start: channelPtr, count: validChunkFrames))
+                    var blockOffset = 0
 
-                    windowed.withUnsafeBufferPointer { winPtr in
-                        winPtr.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: fftSize / 2) { complexPtr in
-                            vDSP_ctoz(complexPtr, 2, &splitComplex, 1, vDSP_Length(fftSize / 2))
+                    while blockOffset + fftSize <= block.count && frameIndex < numFrames {
+                        block.withUnsafeBufferPointer { bPtr in
+                            vDSP_vmul(bPtr.baseAddress! + blockOffset, 1, window, 1, &windowed, 1, vDSP_Length(fftSize))
                         }
+
+                        windowed.withUnsafeBufferPointer { winPtr in
+                            winPtr.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: fftSize / 2) { complexPtr in
+                                vDSP_ctoz(complexPtr, 2, &splitComplex, 1, vDSP_Length(fftSize / 2))
+                            }
+                        }
+
+                        vDSP_fft_zrip(fftSetup, &splitComplex, 1, log2n, FFTDirection(FFT_FORWARD))
+                        vDSP_zvabs(&splitComplex, 1, &magnitudes, 1, vDSP_Length(fftSize / 2))
+
+                        var totalPower: Float = 0
+                        vDSP_sve(magnitudes, 1, &totalPower, vDSP_Length(fftSize / 2))
+                        let isSilent = totalPower < 0.6
+
+                        for b in 0..<barCount {
+                            let bin = bandBins[b]
+                            let mag = isSilent ? 0 : magnitudes[bin] * (1.0 + Float(b) * 0.08)
+                            let target = isSilent ? 0 : min(1.0, mag / 22.0)
+
+                            if target > smoothed[b] {
+                                smoothed[b] = smoothed[b] * 0.35 + target * 0.65 // 快速起振
+                            } else {
+                                smoothed[b] = smoothed[b] * 0.78 + target * 0.22 // 平滑重力回落
+                            }
+                            if isSilent && smoothed[b] < 0.02 { smoothed[b] = 0 }
+
+                            spectrum[frameIndex * barCount + b] = smoothed[b]
+                        }
+
+                        frameIndex += 1
+                        blockOffset += hopSize
                     }
 
-                    vDSP_fft_zrip(fftSetup, &splitComplex, 1, log2n, FFTDirection(FFT_FORWARD))
-                    vDSP_zvabs(&splitComplex, 1, &magnitudes, 1, vDSP_Length(fftSize / 2))
-
-                    var totalPower: Float = 0
-                    vDSP_sve(magnitudes, 1, &totalPower, vDSP_Length(fftSize / 2))
-                    let isSilent = totalPower < 0.6
-
-                    for b in 0..<barCount {
-                        let bin = bandBins[b]
-                        let mag = isSilent ? 0 : magnitudes[bin] * (1.0 + Float(b) * 0.08)
-                        let target = isSilent ? 0 : min(1.0, mag / 22.0)
-
-                        if target > smoothed[b] {
-                            smoothed[b] = smoothed[b] * 0.35 + target * 0.65 // 快速起振
-                        } else {
-                            smoothed[b] = smoothed[b] * 0.78 + target * 0.22 // 平滑重力回落
-                        }
-                        if isSilent && smoothed[b] < 0.02 { smoothed[b] = 0 }
-
-                        spectrum[f * barCount + b] = smoothed[b]
+                    if blockOffset < block.count {
+                        history = Array(block[blockOffset..<block.count])
+                    } else {
+                        history = []
                     }
                 }
             }
@@ -1739,12 +1760,15 @@ public final class VideoRenderer: @unchecked Sendable {
             }
 
         case .waveRibbon:
-            // Siri 极光流光多层光带（4 层流光谐波 + 极光色彩渐变 + 三次样条平滑曲线，底部悬浮、恒定实体、永驻最上层）
+            // Siri 极光流光多层光带（5 条高保真流光谐波 + 动态音量透明度无级过渡，底部悬浮、恒定实体、永驻最上层）
             let baseY: CGFloat = max(44 * scale, canvas.height * 0.046)
             let ribbonWidth: CGFloat = min(canvas.width - 60, 440 * scale)
             let startX = (canvas.width - ribbonWidth) / 2
             let points = 80
             let step = ribbonWidth / CGFloat(points - 1)
+
+            // 周期循环相位，确保 10+ 小时超长视频下三角函数相位永不溢出与失真
+            let animTime = time.truncatingRemainder(dividingBy: 3600.0)
 
             // 提取高低频分量能量（连续线性推导，杜绝硬阈值跳变）
             var bassEnergy: CGFloat = 0
@@ -1761,7 +1785,7 @@ public final class VideoRenderer: @unchecked Sendable {
 
             // 连续平滑动态增益（实体饱满、清晰明亮、随声音自然舒展）
             let normEnergy = min(1.0, max(0.0, avgEnergy * 3.5))
-            let idleBreath = CGFloat(0.6 * sin(time * 2.4))
+            let idleBreath = CGFloat(0.6 * sin(animTime * 2.4))
             let dynamicWave = min(36.0 * scale, (bassEnergy * 24.0 + trebleEnergy * 14.0) * scale)
             let baseAmp: CGFloat = (5.0 * scale + idleBreath * scale) + dynamicWave
 
@@ -1779,9 +1803,9 @@ public final class VideoRenderer: @unchecked Sendable {
                     // 汉宁窗包络：两端平滑归零，中心饱满
                     let env = pow(sin(normX * .pi), 1.25)
 
-                    let wave1 = sin(normX * .pi * freq1 + time * speed + phaseOffset)
-                    let wave2 = cos(normX * .pi * freq2 - time * (speed * 0.75) + phaseOffset * 1.3) * 0.42
-                    let wave3 = sin(normX * .pi * freq3 + time * (speed * 1.2) + phaseOffset * 0.7) * 0.22
+                    let wave1 = sin(normX * .pi * freq1 + animTime * speed + phaseOffset)
+                    let wave2 = cos(normX * .pi * freq2 - animTime * (speed * 0.75) + phaseOffset * 1.3) * 0.42
+                    let wave3 = sin(normX * .pi * freq3 + animTime * (speed * 1.2) + phaseOffset * 0.7) * 0.22
                     let rawDy = baseAmp * ampFactor * CGFloat(wave1 + wave2 + wave3) * CGFloat(env)
                     let safeDy = max(-maxDownwardExcursion, rawDy)
 
