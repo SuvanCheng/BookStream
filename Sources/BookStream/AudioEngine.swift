@@ -120,6 +120,8 @@ public final class AudioEngine: @unchecked Sendable {
         pauseScale: Float = 1.0,
         enableVocalWarmth: Bool = true,
         progress: @escaping @Sendable @MainActor (Int, Int) -> Void,
+        pauseCheck: (@Sendable () throws -> Void)? = nil,
+        isPaused: (@Sendable () -> Bool)? = nil,
         cancellation: @escaping @Sendable () -> Bool
     ) async throws -> SynthResult {
         try await withCheckedThrowingContinuation { continuation in
@@ -137,6 +139,8 @@ public final class AudioEngine: @unchecked Sendable {
                             pauseScale: pauseScale,
                             enableVocalWarmth: enableVocalWarmth,
                             progress: progress,
+                            pauseCheck: pauseCheck,
+                            isPaused: isPaused,
                             cancellation: cancellation
                         )
                     }
@@ -163,6 +167,8 @@ public final class AudioEngine: @unchecked Sendable {
         overflowPolicy: SubtitleOverflowPolicy = .extend,
         enableVocalWarmth: Bool = true,
         progress: @escaping @Sendable @MainActor (Int, Int) -> Void,
+        pauseCheck: (@Sendable () throws -> Void)? = nil,
+        isPaused: (@Sendable () -> Bool)? = nil,
         cancellation: @escaping @Sendable () -> Bool
     ) async throws -> SynthResult {
         try await withCheckedThrowingContinuation { continuation in
@@ -180,6 +186,8 @@ public final class AudioEngine: @unchecked Sendable {
                             overflowPolicy: overflowPolicy,
                             enableVocalWarmth: enableVocalWarmth,
                             progress: progress,
+                            pauseCheck: pauseCheck,
+                            isPaused: isPaused,
                             cancellation: cancellation
                         )
                     }
@@ -204,6 +212,8 @@ public final class AudioEngine: @unchecked Sendable {
         pauseScale: Float,
         enableVocalWarmth: Bool = true,
         progress: @escaping @Sendable @MainActor (Int, Int) -> Void,
+        pauseCheck: (@Sendable () throws -> Void)? = nil,
+        isPaused: (@Sendable () -> Bool)? = nil,
         cancellation: @escaping @Sendable () -> Bool
     ) throws -> SynthResult {
         try? FileManager.default.removeItem(at: outputURL)
@@ -218,6 +228,7 @@ public final class AudioEngine: @unchecked Sendable {
         let batchSize = (engine == .kokoro) ? 64 : 16
         while s < sentences.count {
             if cancellation() { throw BookStreamError.cancelled }
+            try pauseCheck?()
             let end = min(s + batchSize, sentences.count)
             let windowTexts = Array(allTexts[s..<end])
             let perSentence: [[AVAudioPCMBuffer]]
@@ -231,12 +242,15 @@ public final class AudioEngine: @unchecked Sendable {
                     onProgress: { [self] cur, _ in
                         self.reportProgress(progress, done: baseIndex + cur, total: sentences.count)
                     },
+                    isPaused: isPaused,
                     cancellation: cancellation
                 )
             } else {
-                perSentence = try windowTexts.map { t in
+                var list: [[AVAudioPCMBuffer]] = []
+                for t in windowTexts {
                     if cancellation() { throw BookStreamError.cancelled }
-                    return try renderOne(
+                    try pauseCheck?()
+                    let item = try renderOne(
                         sentence: t,
                         engine: engine,
                         kokoroVoice: kokoroVoice,
@@ -245,7 +259,9 @@ public final class AudioEngine: @unchecked Sendable {
                         rate: rate,
                         cancellation: cancellation
                     )
+                    list.append(item)
                 }
+                perSentence = list
             }
             for j in 0..<perSentence.count {
                 if cancellation() { throw BookStreamError.cancelled }
@@ -297,6 +313,8 @@ public final class AudioEngine: @unchecked Sendable {
         overflowPolicy: SubtitleOverflowPolicy,
         enableVocalWarmth: Bool = true,
         progress: @escaping @Sendable @MainActor (Int, Int) -> Void,
+        pauseCheck: (@Sendable () throws -> Void)? = nil,
+        isPaused: (@Sendable () -> Bool)? = nil,
         cancellation: @escaping @Sendable () -> Bool
     ) throws -> SynthResult {
         try? FileManager.default.removeItem(at: outputURL)
@@ -318,6 +336,7 @@ public final class AudioEngine: @unchecked Sendable {
                 onProgress: { [self] cur, tot in
                     self.reportProgress(progress, done: cur, total: tot)
                 },
+                isPaused: isPaused,
                 cancellation: cancellation
             )
         } else {
@@ -326,6 +345,7 @@ public final class AudioEngine: @unchecked Sendable {
 
         for (i, entry) in entries.enumerated() {
             if cancellation() { throw BookStreamError.cancelled }
+            try pauseCheck?()
 
             let entryStart = Int64((entry.start * AudioFormat.sampleRate).rounded())
             let entryEnd = Int64((entry.end * AudioFormat.sampleRate).rounded())

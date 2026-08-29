@@ -197,6 +197,7 @@ public final class KokoroTTS: @unchecked Sendable {
         voice: String,
         rate: Float,
         onProgress: (@Sendable (Int, Int) -> Void)? = nil,
+        isPaused: (@Sendable () -> Bool)? = nil,
         cancellation: (@Sendable () -> Bool)? = nil
     ) throws -> [[AVAudioPCMBuffer]] {
         guard !texts.isEmpty else { return [] }
@@ -209,6 +210,7 @@ public final class KokoroTTS: @unchecked Sendable {
                 voice: voice,
                 rate: rate,
                 onProgress: onProgress,
+                isPaused: isPaused,
                 cancellation: cancellation
             )
         }
@@ -230,6 +232,7 @@ public final class KokoroTTS: @unchecked Sendable {
                 onProgress: { done, _ in
                     onProgress?(baseOffset + done, texts.count)
                 },
+                isPaused: isPaused,
                 cancellation: cancellation
             )
 
@@ -240,12 +243,13 @@ public final class KokoroTTS: @unchecked Sendable {
         return allResults
     }
 
-    /// 单块批量合成（单进程批处理）
+    /// 单块批量合成（单进程批处理，支持 SIGSTOP / SIGCONT 零消耗暂停与恢复）
     private func renderBatchInternal(
         texts: [String],
         voice: String,
         rate: Float,
         onProgress: (@Sendable (Int, Int) -> Void)? = nil,
+        isPaused: (@Sendable () -> Bool)? = nil,
         cancellation: (@Sendable () -> Bool)? = nil
     ) throws -> [[AVAudioPCMBuffer]] {
         guard !texts.isEmpty else { return [] }
@@ -315,14 +319,31 @@ public final class KokoroTTS: @unchecked Sendable {
         Self.registerActiveProcess(process)
         defer { Self.unregisterActiveProcess(process) }
 
-        // 毫秒级非阻塞轮询：一旦用户点击取消，立即杀掉 Python 子进程并退出
+        // 毫秒级非阻塞轮询：支持暂停挂起 (SIGSTOP/SIGCONT) 与即时取消 (SIGKILL)
+        var isProcessSuspended = false
         while process.isRunning {
             if cancellation?() == true {
+                if isProcessSuspended {
+                    kill(process.processIdentifier, SIGCONT)
+                }
                 outHandle.readabilityHandler = nil
                 process.terminate()
                 kill(process.processIdentifier, SIGKILL)
                 throw BookStreamError.cancelled
             }
+
+            if isPaused?() == true {
+                if !isProcessSuspended {
+                    kill(process.processIdentifier, SIGSTOP)
+                    isProcessSuspended = true
+                }
+                Thread.sleep(forTimeInterval: 0.1)
+                continue
+            } else if isProcessSuspended {
+                kill(process.processIdentifier, SIGCONT)
+                isProcessSuspended = false
+            }
+
             Thread.sleep(forTimeInterval: 0.05)
         }
         outHandle.readabilityHandler = nil

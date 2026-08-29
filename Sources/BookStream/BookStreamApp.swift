@@ -6,6 +6,7 @@ extension Notification.Name {
     static let bookStreamReloadFile = Notification.Name("BookStream.reloadFile")
     static let bookStreamStartExport = Notification.Name("BookStream.startExport")
     static let bookStreamCancelExport = Notification.Name("BookStream.cancelExport")
+    static let bookStreamTogglePause = Notification.Name("BookStream.togglePause")
 }
 
 @main
@@ -62,6 +63,12 @@ struct BookStreamApp: App {
                 }
                 .keyboardShortcut("e", modifiers: .command)
                 .disabled(model.inputKind == nil || model.isProcessing)
+
+                Button(model.isPaused ? "继续生成导出" : "暂停生成导出") {
+                    NotificationCenter.default.post(name: .bookStreamTogglePause, object: nil)
+                }
+                .keyboardShortcut("p", modifiers: .command)
+                .disabled(!model.isProcessing)
 
                 Button("取消导出") {
                     NotificationCenter.default.post(name: .bookStreamCancelExport, object: nil)

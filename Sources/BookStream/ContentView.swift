@@ -92,14 +92,19 @@ final class AppModel: ObservableObject {
     // 中英双语字幕配置（UserDefaults 持久化）
     @Published var translationSettings: TranslationSettings = AppModel.loadTranslationSettings()
 
+    /// 忽略已有翻译存档，下次导出时强制全部重新翻译（配合「删除存档」按钮使用）
+    @Published var forceRetranslate = false
+
     // 运行状态
     @Published var isProcessing = false
+    @Published var isPaused = false
     @Published var progress: Double = 0
     @Published var progressText = ""
     @Published var logLines: [String] = []
     @Published var previewURL: URL?
     @Published var errorMessage: String?
 
+    let pauseController = PauseController()
     private var pipelineTask: Task<Void, Never>?
     private let cancelFlag = OSAllocatedUnfairLock(initialState: false)
     private var hasUserPickedVoice: Bool = AppModel.loadHasUserPickedVoice()
@@ -109,6 +114,7 @@ final class AppModel: ObservableObject {
     private var exportStartTime = Date()
     private var phaseStartTime = Date()
     private var lastLoggedPercent = -1
+    private weak var activeSavePanel: NSSavePanel?
 
     // MARK: - 派生信息
 
@@ -130,6 +136,8 @@ final class AppModel: ObservableObject {
                 needsTranslation: translationSettings.enabled,
                 toTranslateCount: toTr,
                 isDeepSeek: translationSettings.provider == .deepseek,
+                translationConcurrency: translationSettings.concurrentRequests,
+                translationDisableThinking: translationSettings.disableThinking,
                 hasVisualizer: visualizerStyle != .off
             )
             return "\(title) · \(sentences.count) 句 · \(chars) 字 · 视频时长约 \(Self.formatDuration(audioEst)) · 生成耗时约 \(Self.formatDuration(est.totalDuration))"
@@ -202,13 +210,23 @@ final class AppModel: ObservableObject {
         needsTranslation: Bool = false,
         toTranslateCount: Int = 0,
         isDeepSeek: Bool = false,
+        translationConcurrency: Int = 1,
+        translationDisableThinking: Bool = true,
         hasVisualizer: Bool = true
     ) -> GenerationEstimate {
-        // 1. 翻译预估耗时（实测 MyMemory 约 5.5 句/秒，DeepSeek 约 4.5 句/秒）
+        // 1. 翻译预估耗时：思考关闭实测约 2~4s/批（深度思考开启约 20~30s/批），按并发批数线性缩短；
+        //    拆句阶段按超长句比例附加 ~25% 开销（仅思考关闭时需要，拆句请求小且快）。免费免配置接口实测约 0.35s/句。
         let trTime: Double
         if needsTranslation && toTranslateCount > 0 {
-            let perSentence = isDeepSeek ? 0.22 : 0.18
-            trTime = Double(toTranslateCount) * perSentence
+            if isDeepSeek {
+                let batches = ceil(Double(toTranslateCount) / 8.0)
+                let conc = Double(max(1, min(translationConcurrency, 32)))
+                let perBatch = translationDisableThinking ? 4.0 : 25.0
+                let splitOverhead = translationDisableThinking ? 1.25 : 1.0
+                trTime = batches * perBatch * splitOverhead / conc
+            } else {
+                trTime = max(2.0, Double(toTranslateCount) * 0.35)
+            }
         } else {
             trTime = 0.0
         }
@@ -513,11 +531,18 @@ final class AppModel: ObservableObject {
                 }.value
 
                 // 自动检查并恢复本地已有翻译存档（如 odyssey.translation.json，实现秒级复用与零Token浪费）
-                let (sentences, restoredCount, cpURL) = Translator.restoreFromCheckpoint(
-                    sentences: parsedSentences,
-                    bookFileURL: url,
-                    bookTitle: url.deletingPathExtension().lastPathComponent
-                )
+                var sentences = parsedSentences
+                var restoredCount = 0
+                var cpURL: URL? = nil
+                if forceRetranslate {
+                    log("♻️ 已开启「忽略存档 · 强制重新翻译」，本次导入不恢复任何已有译文")
+                } else {
+                    (sentences, restoredCount, cpURL) = Translator.restoreFromCheckpoint(
+                        sentences: parsedSentences,
+                        bookFileURL: url,
+                        bookTitle: url.deletingPathExtension().lastPathComponent
+                    )
+                }
 
                 inputKind = .book(
                     title: url.deletingPathExtension().lastPathComponent,
@@ -541,6 +566,8 @@ final class AppModel: ObservableObject {
                     needsTranslation: translationSettings.enabled,
                     toTranslateCount: toTr,
                     isDeepSeek: translationSettings.provider == .deepseek,
+                    translationConcurrency: translationSettings.concurrentRequests,
+                    translationDisableThinking: translationSettings.disableThinking,
                     hasVisualizer: visualizerStyle != .off
                 )
                 log("预估: 视频时长约 \(Self.formatDuration(audioEst)) · 生成耗时约 \(Self.formatDuration(est.totalDuration))（\(est.summaryString())）")
@@ -615,8 +642,13 @@ final class AppModel: ObservableObject {
 
     func startExport() {
         guard let input = inputKind, !isProcessing else { return }
+        if let existing = activeSavePanel {
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
 
         let panel = NSSavePanel()
+        activeSavePanel = panel
         panel.canCreateDirectories = true
         let stamp = Int(Date().timeIntervalSince1970)
         // 文件名格式：书名-音色名-[AI|sys]-语速-停顿x-分辨率-mark|nomark-时间戳.mp4
@@ -716,46 +748,52 @@ final class AppModel: ObservableObject {
             panel.allowedContentTypes = [.mpeg4Movie]
         }
         panel.nameFieldStringValue = sanitizeFilename("\(baseName)-\(stamp)")
-        let response = panel.runModal()
-        guard response == .OK, let url = panel.url else {
-            log("已取消保存面板")
-            return
-        }
-
-        isProcessing = true
-        progress = 0
-        progressText = "准备中..."
-        previewURL = nil
-        errorMessage = nil
-        exportStartTime = Date()
-        lastLoggedPercent = -1
-        cancelFlag.withLock { $0 = false }
-        let cancelled: @Sendable () -> Bool = { [lock = cancelFlag] in
-            lock.withLock { $0 }
-        }
-
-        log("开始导出 · 模式=\(exportMode.rawValue) · 输出=\(url.path)")
-        let resSuffix = exportMode == .video
-            ? " · 分辨率=\(videoResolution.label) · 帧率=\(frameRate)fps"
-            : ""
-        let bgmLabel: String
-        switch bgmPreset {
-        case .none: bgmLabel = "关闭"
-        case .gentlePiano: bgmLabel = "舒缓和弦 (\(Int(bgmVolume * 100))%)"
-        case .oceanWaves: bgmLabel = "海浪波涛 (\(Int(bgmVolume * 100))%)"
-        case .rainAmbience: bgmLabel = "沉浸雨声 (\(Int(bgmVolume * 100))%)"
-        case .fireplace: bgmLabel = "温暖壁炉 (\(Int(bgmVolume * 100))%)"
-        case .mountainStream: bgmLabel = "山间小溪 (\(Int(bgmVolume * 100))%)"
-        case .forestWind: bgmLabel = "林间微风 (\(Int(bgmVolume * 100))%)"
-        case .darkNoise: bgmLabel = "暗噪音 (\(Int(bgmVolume * 100))%)"
-        case .pinkNoise: bgmLabel = "平衡粉噪 (\(Int(bgmVolume * 100))%)"
-        case .custom: bgmLabel = "\(bgmURL?.lastPathComponent ?? "未选") (\(Int(bgmVolume * 100))%)"
-        }
-        log("  参数: 声音=\(voiceCore)\(voiceTag) · 语速=\(String(format: "%.2f", speechRate)) · 高亮色=\(highlightColorDescription)\(resSuffix) · BGM=\(bgmLabel) · 复用音频=\(useExistingAudio ? (companionAudioURL?.lastPathComponent ?? "未选") : "否")")
-
-        pipelineTask = Task { [weak self] in
+        panel.begin { [weak self] response in
             guard let self else { return }
-            await self.runPipeline(input: input, outputBase: url, cancelled: cancelled)
+            self.activeSavePanel = nil
+            guard response == .OK, let url = panel.url else {
+                self.log("已取消保存面板")
+                return
+            }
+            guard !self.isProcessing else { return }
+
+            self.isProcessing = true
+            self.isPaused = false
+            self.pauseController.reset()
+            self.progress = 0
+            self.progressText = "准备中..."
+            self.previewURL = nil
+            self.errorMessage = nil
+            self.exportStartTime = Date()
+            self.lastLoggedPercent = -1
+            self.cancelFlag.withLock { $0 = false }
+            let cancelled: @Sendable () -> Bool = { [lock = self.cancelFlag] in
+                lock.withLock { $0 }
+            }
+
+            self.log("开始导出 · 模式=\(self.exportMode.rawValue) · 输出=\(url.path)")
+            let resSuffix = self.exportMode == .video
+                ? " · 分辨率=\(self.videoResolution.label) · 帧率=\(self.frameRate)fps"
+                : ""
+            let bgmLabel: String
+            switch self.bgmPreset {
+            case .none: bgmLabel = "关闭"
+            case .gentlePiano: bgmLabel = "舒缓和弦 (\(Int(self.bgmVolume * 100))%)"
+            case .oceanWaves: bgmLabel = "海浪波涛 (\(Int(self.bgmVolume * 100))%)"
+            case .rainAmbience: bgmLabel = "沉浸雨声 (\(Int(self.bgmVolume * 100))%)"
+            case .fireplace: bgmLabel = "温暖壁炉 (\(Int(self.bgmVolume * 100))%)"
+            case .mountainStream: bgmLabel = "山间小溪 (\(Int(self.bgmVolume * 100))%)"
+            case .forestWind: bgmLabel = "林间微风 (\(Int(self.bgmVolume * 100))%)"
+            case .darkNoise: bgmLabel = "暗噪音 (\(Int(self.bgmVolume * 100))%)"
+            case .pinkNoise: bgmLabel = "平衡粉噪 (\(Int(self.bgmVolume * 100))%)"
+            case .custom: bgmLabel = "\(self.bgmURL?.lastPathComponent ?? "未选") (\(Int(self.bgmVolume * 100))%)"
+            }
+            self.log("  参数: 声音=\(voiceCore)\(voiceTag) · 语速=\(String(format: "%.2f", self.speechRate)) · 高亮色=\(self.highlightColorDescription)\(resSuffix) · BGM=\(bgmLabel) · 复用音频=\(self.useExistingAudio ? (self.companionAudioURL?.lastPathComponent ?? "未选") : "否")")
+
+            self.pipelineTask = Task { [weak self] in
+                guard let self else { return }
+                await self.runPipeline(input: input, outputBase: url, cancelled: cancelled)
+            }
         }
     }
 
@@ -850,8 +888,21 @@ final class AppModel: ObservableObject {
 
     func cancelExport() {
         cancelFlag.withLock { $0 = true }
+        pauseController.resume() // 唤醒任何等待暂停的协程/线程以即时取消退出
+        isPaused = false
         pipelineTask?.cancel()
         log("正在取消...")
+    }
+
+    func togglePause() {
+        guard isProcessing else { return }
+        let paused = pauseController.toggle()
+        isPaused = paused
+        if paused {
+            log("⏸ 任务已暂停（网络请求与音视频渲染已安全挂起；可随时切换 Wi-Fi 或休眠电脑，点击「继续」无缝恢复）")
+        } else {
+            log("▶︎ 任务已恢复执行")
+        }
     }
 
     private func runPipeline(
@@ -873,19 +924,51 @@ final class AppModel: ObservableObject {
             }
         }
 
+        let pauseCheckAsync: @Sendable () async throws -> Void = { [pc = self.pauseController] in
+            try await pc.waitIfPaused(cancellation: cancelled)
+        }
+        let pauseCheckSync: @Sendable () throws -> Void = { [pc = self.pauseController] in
+            try pc.waitIfPausedSync(cancellation: cancelled)
+        }
+        let isPausedCheck: @Sendable () -> Bool = { [pc = self.pauseController] in
+            pc.isPaused
+        }
+
         do {
             switch (input, exportMode) {
             case (.book(let url, let rawSentences), let mode):
                 var sentences = rawSentences
+                // 强制重译：先删存档文件（书旁 + 全局备份）并清空内存译文，保证本次导出全部重新翻译
+                if forceRetranslate {
+                    if let archiveURL = currentBookArchiveURL {
+                        try? FileManager.default.removeItem(at: archiveURL)
+                        try? FileManager.default.removeItem(at: archiveBackupURL(for: archiveURL))
+                    }
+                    sentences = sentences.map { s -> Sentence in
+                        var copy = s
+                        copy.translation = nil
+                        return copy
+                    }
+                    log("♻️ 已启用「忽略存档 · 强制重新翻译」：本次导出将重新翻译全部句子")
+                }
                 if translationSettings.enabled {
                     let toTrCount = sentences.filter { ($0.translation?.isEmpty ?? true) && TextProcessor.isPrimarilyEnglish($0.text) }.count
                     if toTrCount > 0 {
-                        log("正在执行中英双语智能文学翻译（\(translationSettings.provider.displayName)，待翻译 \(toTrCount) 句）...")
+                        // 翻译阶段进度基准：重置阶段起始时间与 10% 记录桶，避免「已用」误用上一阶段/启动时间
+                        phaseStartTime = Date()
+                        lastLoggedPercent = -1
+                        let activeModel = translationSettings.model.isEmpty ? translationSettings.provider.defaultModel : translationSettings.model
+                        let activeEndpoint = translationSettings.endpointURL.isEmpty ? translationSettings.provider.defaultEndpoint : translationSettings.endpointURL
+                        log("正在执行中英双语智能文学翻译（服务商=\(translationSettings.provider.displayName) · 模型=\(activeModel) · 端点=\(activeEndpoint)，待翻译 \(toTrCount) 句）...")
                         let trStart = Date()
+                        // 注意：InputKind.book 的第一关联值是「标题字符串」而非路径，必须用 inputURL 取真实书籍路径，
+                        // 否则书旁存档（translation.json / bilingual.txt）会写到错误位置并静默失败
+                        let bookFileURL = inputURL
                         sentences = try await Translator.translateBook(
                             sentences: sentences,
-                            bookFileURL: URL(fileURLWithPath: url),
-                            bookTitle: URL(fileURLWithPath: url).deletingPathExtension().lastPathComponent,
+                            bookFileURL: bookFileURL,
+                            bookTitle: bookFileURL?.deletingPathExtension().lastPathComponent ?? url,
+                            isPortrait: videoAspectRatio == .portrait9_16,
                             settings: translationSettings,
                             onProgress: { [weak self] done, total in
                                 Task { @MainActor [weak self] in
@@ -897,6 +980,7 @@ final class AppModel: ObservableObject {
                                     self?.log(status)
                                 }
                             },
+                            pauseCheck: pauseCheckAsync,
                             cancellation: cancelled
                         )
                         log("中英双语翻译完成（共 \(sentences.count) 句，耗时 \(String(format: "%.1f", Date().timeIntervalSince(trStart)))s）")
@@ -920,6 +1004,8 @@ final class AppModel: ObservableObject {
                             base: chBase,
                             mode: mode,
                             engine: engine,
+                            pauseCheck: pauseCheckSync,
+                            isPaused: isPausedCheck,
                             cancelled: cancelled,
                             label: tag
                         )
@@ -930,13 +1016,16 @@ final class AppModel: ObservableObject {
                     filesToCleanOnFailure = allCreated
                     progress = 1
                     progressText = "完成"
-                    log("全部分卷导出完成: 共产出 \(chapterRanges.count) 卷（总耗时 \(String(format: "%.1f", Date().timeIntervalSince(t0)))s）")
+                    let totalNetTime = max(0.01, Date().timeIntervalSince(t0) - self.pauseController.pausedTime(since: t0))
+                    log("全部分卷导出完成: 共产出 \(chapterRanges.count) 卷（总耗时 \(String(format: "%.1f", totalNetTime))s）")
                 } else {
                     let (totalDur, mainURL, created) = try await renderSentenceBatch(
                         sentences: sentences,
                         base: base,
                         mode: mode,
                         engine: engine,
+                        pauseCheck: pauseCheckSync,
+                        isPaused: isPausedCheck,
                         cancelled: cancelled,
                         label: nil
                     )
@@ -975,6 +1064,8 @@ final class AppModel: ObservableObject {
                     progress: { [weak self] done, total in
                         self?.updateProgress(Double(done) / Double(max(total, 1)), text: "旁白抓轨 \(done)/\(total) 条")
                     },
+                    pauseCheck: pauseCheckSync,
+                    isPaused: isPausedCheck,
                     cancellation: cancelled
                 )
                 for warning in result.warnings { log("⚠︎ " + warning) }
@@ -986,7 +1077,8 @@ final class AppModel: ObservableObject {
                 progress = 1
                 progressText = "完成"
                 log("完成: \(wavURL.lastPathComponent) + \(srtURL.lastPathComponent) + \(assURL.lastPathComponent)")
-                log("  结果: \(result.segments.count) 条 / 音频 \(String(format: "%.2f", result.segments.last?.end ?? 0))s / 总耗时 \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
+                let netDur1 = max(0.01, Date().timeIntervalSince(t0) - self.pauseController.pausedTime(since: t0))
+                log("  结果: \(result.segments.count) 条 / 音频 \(String(format: "%.2f", result.segments.last?.end ?? 0))s / 总耗时 \(String(format: "%.1f", netDur1))s")
 
             case (.subtitles(_, let entries), .m4b):
                 log("开始字幕旁白 TTS 抓轨并封装 M4B 有声书...")
@@ -1004,6 +1096,8 @@ final class AppModel: ObservableObject {
                     progress: { [weak self] done, total in
                         self?.updateProgress(Double(done) / Double(max(total, 1)), text: "旁白抓轨 \(done)/\(total) 条")
                     },
+                    pauseCheck: pauseCheckSync,
+                    isPaused: isPausedCheck,
                     cancellation: cancelled
                 )
                 for warning in result.warnings { log("⚠︎ " + warning) }
@@ -1017,7 +1111,8 @@ final class AppModel: ObservableObject {
                 progress = 1
                 progressText = "完成"
                 log("完成: \(m4bURL.lastPathComponent) + \(srtURL.lastPathComponent) + \(assURL.lastPathComponent)")
-                log("  结果: \(result.segments.count) 条 / M4B \(fileSize(m4bURL)) / 总耗时 \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
+                let netDur2 = max(0.01, Date().timeIntervalSince(t0) - self.pauseController.pausedTime(since: t0))
+                log("  结果: \(result.segments.count) 条 / M4B \(fileSize(m4bURL)) / 总耗时 \(String(format: "%.1f", netDur2))s")
 
             case (.subtitles(_, let entries), .video):
                 // 解耦：若用户已提供「已有音频 + 字幕」，直接复用其时间轴渲染，完全跳过 TTS
@@ -1059,6 +1154,7 @@ final class AppModel: ObservableObject {
                         progress: { [weak self] p in
                             self?.updateProgress(p, text: "视频渲染 \(Int(p * 100))%")
                         },
+                        pauseCheck: pauseCheckSync,
                         cancellation: cancelled
                     )
                     logPhaseCompletion(phase: "视频渲染", elapsed: Date().timeIntervalSince(renderStart), mediaDuration: totalDur)
@@ -1080,6 +1176,8 @@ final class AppModel: ObservableObject {
                         progress: { [weak self] done, total in
                             self?.updateProgress(Double(done) / Double(max(total, 1)), text: "旁白抓轨 \(done)/\(total) 条")
                         },
+                        pauseCheck: pauseCheckSync,
+                        isPaused: isPausedCheck,
                         cancellation: cancelled
                     )
                     for warning in result.warnings { self.log("⚠︎ " + warning) }
@@ -1118,6 +1216,7 @@ final class AppModel: ObservableObject {
                         progress: { [weak self] p in
                             self?.updateProgress(p, text: "视频渲染 \(Int(p * 100))%")
                         },
+                        pauseCheck: pauseCheckSync,
                         cancellation: cancelled
                     )
                     logPhaseCompletion(phase: "视频渲染", elapsed: Date().timeIntervalSince(renderStart), mediaDuration: totalDur)
@@ -1171,6 +1270,8 @@ final class AppModel: ObservableObject {
         base: URL,
         mode: ExportMode,
         engine: AudioEngine,
+        pauseCheck: (@Sendable () throws -> Void)? = nil,
+        isPaused: (@Sendable () -> Bool)? = nil,
         cancelled: @Sendable @escaping () -> Bool,
         label: String? = nil
     ) async throws -> (mediaDuration: Double, mainOutputURL: URL, allOutputs: [URL]) {
@@ -1216,6 +1317,8 @@ final class AppModel: ObservableObject {
             progress: { [weak self] done, total in
                 self?.updateProgress(Double(done) / Double(max(total, 1)), text: "\(prefix)TTS 抓轨 \(done)/\(total) 句")
             },
+            pauseCheck: pauseCheck,
+            isPaused: isPaused,
             cancellation: cancelled
         )
         let totalDur = result.segments.last?.end ?? 0
@@ -1275,6 +1378,7 @@ final class AppModel: ObservableObject {
             progress: { [weak self] p in
                 self?.updateProgress(p, text: "\(prefix)视频渲染 \(Int(p * 100))%")
             },
+            pauseCheck: pauseCheck,
             cancellation: cancelled
         )
         logPhaseCompletion(phase: "\(prefix)视频渲染", elapsed: Date().timeIntervalSince(renderStart), mediaDuration: totalDur)
@@ -1307,23 +1411,26 @@ final class AppModel: ObservableObject {
 
     private func updateProgress(_ p: Double, text: String) {
         progress = p
-        progressText = text
+        progressText = isPaused ? "[已暂停] \(text)" : text
         // 每跨越 10% 边界记录一次：已用时间 + 按当前阶段实际速度推算的剩余时间
         // （0% 不记：阶段切换时的「0%」与阶段完成日志重复）
         let pct = Int(p * 100)
         let bucket = pct / 10 * 10
         if bucket != lastLoggedPercent, bucket >= 10 {
             lastLoggedPercent = bucket
-            let elapsed = Date().timeIntervalSince(phaseStartTime)
+            let rawElapsed = Date().timeIntervalSince(phaseStartTime)
+            let elapsed = max(0.01, rawElapsed - pauseController.pausedTime(since: phaseStartTime))
             let remaining = p > 0.01 ? elapsed / p - elapsed : 0
-            log("\(text) · 已用 \(Self.formatDuration(elapsed)) · 剩余约 \(Self.formatDuration(remaining))")
+            let pauseTag = isPaused ? "[已暂停] " : ""
+            log("\(pauseTag)\(text) · 已用 \(Self.formatDuration(elapsed)) · 剩余约 \(Self.formatDuration(remaining))")
         }
     }
 
     /// 阶段完成日志：实际用时 + 产出时长 + 相对实时的速度倍数。
     private func logPhaseCompletion(phase: String, elapsed: TimeInterval, mediaDuration: Double) {
-        let ratio = elapsed > 0 ? mediaDuration / elapsed : 0
-        log("\(phase)完成: 用时 \(Self.formatDuration(elapsed)) · 产出 \(String(format: "%.1f", mediaDuration))s 内容 · 实时率 \(String(format: "%.1f", ratio))×")
+        let netElapsed = max(0.01, elapsed - pauseController.pausedTime(since: phaseStartTime))
+        let ratio = netElapsed > 0 ? mediaDuration / netElapsed : 0
+        log("\(phase)完成: 用时 \(Self.formatDuration(netElapsed)) · 产出 \(String(format: "%.1f", mediaDuration))s 内容 · 实时率 \(String(format: "%.1f", ratio))×")
     }
 
     private func fileSize(_ url: URL) -> String {
@@ -1403,6 +1510,89 @@ final class AppModel: ObservableObject {
     func saveTranslationSettings() {
         if let data = try? JSONEncoder().encode(translationSettings) {
             UserDefaults.standard.set(data, forKey: "BookStream.translationSettings")
+        }
+    }
+
+    // MARK: - 翻译存档管理（可查 / 可删 / 可另存）
+
+    /// 当前已加载书籍对应的翻译存档 URL（书旁同名文件；无书籍时返回 nil）
+    var currentBookArchiveURL: URL? {
+        guard case .book = inputKind, let url = inputURL else { return nil }
+        return Translator.getCheckpointURL(bookFileURL: url, bookTitle: url.deletingPathExtension().lastPathComponent)
+    }
+
+    /// 存档备份目录（~/.bookstream/translations/<同名>）
+    private func archiveBackupURL(for url: URL) -> URL {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return home.appendingPathComponent(".bookstream/translations/\(url.lastPathComponent)")
+    }
+
+    /// 存档摘要文案：存在时返回 "已存档 N/M 句 · 文件名"，不存在返回 nil
+    func translationArchiveSummary() -> String? {
+        guard let url = currentBookArchiveURL, FileManager.default.fileExists(atPath: url.path) else { return nil }
+        var completed = 0
+        var total = 0
+        if let data = try? Data(contentsOf: url),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            completed = (json["completedSentences"] as? Int) ?? 0
+            total = (json["totalSentences"] as? Int) ?? 0
+        }
+        return "📦 已有翻译存档：\(completed)/\(total) 句（\(url.lastPathComponent)）"
+    }
+
+    /// 删除存档（书旁 + 全局备份两处都删），并同步清空内存中的恢复译文
+    func deleteTranslationArchive() {
+        guard let url = currentBookArchiveURL else {
+            log("当前没有已加载的书籍，无法删除存档")
+            return
+        }
+        var removed = false
+        if FileManager.default.fileExists(atPath: url.path) {
+            try? FileManager.default.removeItem(at: url)
+            removed = true
+        }
+        let backup = archiveBackupURL(for: url)
+        if FileManager.default.fileExists(atPath: backup.path) {
+            try? FileManager.default.removeItem(at: backup)
+            removed = true
+        }
+        if removed {
+            log("🗑 已删除翻译存档：\(url.lastPathComponent)（下次导出将重新翻译）")
+        } else {
+            log("没有找到可删除的翻译存档（\(url.lastPathComponent)）")
+        }
+        // 同步清空内存中从存档恢复的译文，使界面与下次导出都回到「未翻译」状态
+        if case .book(let title, let sentences) = inputKind {
+            let cleared = sentences.map { s -> Sentence in
+                var copy = s
+                copy.translation = nil
+                return copy
+            }
+            inputKind = .book(title: title, sentences: cleared)
+        }
+    }
+
+    /// 在 Finder 中定位并选中存档文件
+    func revealTranslationArchive() {
+        guard let url = currentBookArchiveURL, FileManager.default.fileExists(atPath: url.path) else {
+            log("当前没有可查看的翻译存档")
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+        log("已在 Finder 中定位存档：\(url.path)")
+    }
+
+    /// 将存档另存为指定位置的副本（纯文件拷贝，不影响原存档）
+    func exportTranslationArchive(to destURL: URL) {
+        guard let url = currentBookArchiveURL, FileManager.default.fileExists(atPath: url.path) else {
+            log("当前没有可另存的翻译存档")
+            return
+        }
+        do {
+            try FileManager.default.copyItem(at: url, to: destURL)
+            log("💾 翻译存档已另存为：\(destURL.path)")
+        } catch {
+            log("存档另存失败：\(error.localizedDescription)")
         }
     }
 
@@ -1490,6 +1680,53 @@ final class AppModel: ObservableObject {
 
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var activeOpenPanel: NSOpenPanel?
+    @State private var activeSavePanel: NSSavePanel?
+    @State private var confirmDeleteArchive = false
+
+    /// 非阻塞保存面板（遵循项目纪律：杜绝 runModal，避免主线程 1 秒卡顿假象）
+    private func presentSavePanel(_ configure: (NSSavePanel) -> Void, completion: @escaping (URL) -> Void) {
+        if let existing = activeSavePanel {
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
+        let panel = NSSavePanel()
+        configure(panel)
+        activeSavePanel = panel
+        panel.begin { response in
+            activeSavePanel = nil
+            if response == .OK, let url = panel.url {
+                completion(url)
+            }
+        }
+    }
+
+    /// 另存翻译存档副本
+    private func saveArchiveCopy() {
+        guard let archiveURL = model.currentBookArchiveURL else { return }
+        presentSavePanel { panel in
+            panel.canCreateDirectories = true
+            panel.nameFieldStringValue = archiveURL.lastPathComponent
+        } completion: { dest in
+            model.exportTranslationArchive(to: dest)
+        }
+    }
+
+    private func presentOpenPanel(_ configure: (NSOpenPanel) -> Void, completion: @escaping (URL) -> Void) {
+        if let existing = activeOpenPanel {
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
+        let panel = NSOpenPanel()
+        configure(panel)
+        activeOpenPanel = panel
+        panel.begin { response in
+            activeOpenPanel = nil
+            if response == .OK, let url = panel.url {
+                completion(url)
+            }
+        }
+    }
 
     var body: some View {
         HSplitView {
@@ -1527,6 +1764,11 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .bookStreamCancelExport)) { _ in
             if model.isProcessing {
                 model.cancelExport()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .bookStreamTogglePause)) { _ in
+            if model.isProcessing {
+                model.togglePause()
             }
         }
     }
@@ -1637,21 +1879,36 @@ struct ContentView: View {
                 return true
             }
 
-            // 开始生成 (⌘E) / 取消按钮 (⌘.) 紧靠导入框
+            // 开始生成 (⌘E) / 暂停继续 (⌘P) / 取消按钮 (⌘.) 紧靠导入框
             if model.isProcessing {
-                Button(role: .destructive) {
-                    model.cancelExport()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "stop.fill")
-                        Text("取消 (⌘.)")
+                HStack(spacing: 6) {
+                    Button {
+                        model.togglePause()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: model.isPaused ? "play.fill" : "pause.fill")
+                            Text(model.isPaused ? "继续 (⌘P)" : "暂停 (⌘P)")
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 7)
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 7)
+                    .buttonStyle(.borderedProminent)
+                    .tint(model.isPaused ? .green : .orange)
+
+                    Button(role: .destructive) {
+                        model.cancelExport()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "stop.fill")
+                            Text("取消 (⌘.)")
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 7)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+                    .keyboardShortcut(".", modifiers: .command)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.red)
-                .keyboardShortcut(".", modifiers: .command)
             } else {
                 Button {
                     model.startExport()
@@ -1882,6 +2139,21 @@ struct ContentView: View {
                             .textFieldStyle(.roundedBorder)
                             .font(.caption)
                         }
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Toggle("关闭大模型思考模式（推荐 · 纯翻译无需思考，大幅提速）", isOn: Binding(
+                                get: { model.translationSettings.disableThinking },
+                                set: { model.translationSettings.disableThinking = $0; model.saveTranslationSettings() }
+                            ))
+                            .font(.caption)
+                            .toggleStyle(.switch)
+
+                            Stepper("并发翻译批数：\(model.translationSettings.concurrentRequests)（官方 API 并发上限 2500，建议 4~16；本地/自定义端点建议 1~2）", value: Binding(
+                                get: { model.translationSettings.concurrentRequests },
+                                set: { model.translationSettings.concurrentRequests = $0; model.saveTranslationSettings() }
+                            ), in: 1...32)
+                            .font(.caption)
+                        }
                     }
 
                     HStack {
@@ -1894,9 +2166,44 @@ struct ContentView: View {
                         }
                         .font(.caption)
                     }
+
+                    // —— 翻译存档管理（可查 / 可删 / 可另存 / 强制重译）——
+                    if case .book = model.inputKind {
+                        Divider()
+                        if let summary = model.translationArchiveSummary() {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(summary).font(.caption).foregroundStyle(.secondary)
+                                Text("存档自动秒级恢复（0 Token）· 删除后下次导出将重新翻译").font(.caption2).foregroundStyle(.tertiary)
+                                HStack(spacing: 8) {
+                                    Button("查看文件") { model.revealTranslationArchive() }
+                                    Button("删除存档", role: .destructive) { confirmDeleteArchive = true }
+                                    Button("另存副本…") { saveArchiveCopy() }
+                                    Spacer()
+                                }
+                                .font(.caption)
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        } else {
+                            Text("ℹ️ 当前书籍暂无翻译存档 · 首次导出将自动翻译并实时落盘（书旁 <书名>.translation.json + ~/.bookstream/translations 全局备份）")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Toggle("忽略存档 · 强制重新翻译全部", isOn: $model.forceRetranslate)
+                            .font(.caption)
+                            .toggleStyle(.switch)
+                    }
                 }
                 .padding(8)
                 .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.06)))
+                .confirmationDialog("删除翻译存档？", isPresented: $confirmDeleteArchive, titleVisibility: .visible) {
+                    Button("删除存档（下次导出将重新翻译）", role: .destructive) {
+                        model.deleteTranslationArchive()
+                    }
+                    Button("取消", role: .cancel) {}
+                } message: {
+                    Text("将同时删除书旁存档与 ~/.bookstream/translations 全局备份，已恢复的中文译文会被清空。")
+                }
             }
         }
         .padding(8)
@@ -2134,19 +2441,20 @@ struct ContentView: View {
     }
 
     private func importWatermarkImage() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.png, .jpeg, .tiff, .heic]
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            let data = try Data(contentsOf: url)
-            var wm = model.watermark
-            wm.imageData = data
-            wm.enableImage = true
-            model.updateWatermark(wm)
-            model.log("已导入水印图片: \(url.lastPathComponent)")
-        } catch {
-            model.log("导入水印图片失败: \(error.localizedDescription)")
+        presentOpenPanel { panel in
+            panel.allowedContentTypes = [.png, .jpeg, .tiff, .heic]
+            panel.allowsMultipleSelection = false
+        } completion: { url in
+            do {
+                let data = try Data(contentsOf: url)
+                var wm = model.watermark
+                wm.imageData = data
+                wm.enableImage = true
+                model.updateWatermark(wm)
+                model.log("已导入水印图片: \(url.lastPathComponent)")
+            } catch {
+                model.log("导入水印图片失败: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -2260,10 +2568,10 @@ struct ContentView: View {
     }
 
     private func pickCompanionAudio() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.audio, .wav, .mpeg4Audio, .mp3]
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
+        presentOpenPanel { panel in
+            panel.allowedContentTypes = [.audio, .wav, .mpeg4Audio, .mp3]
+            panel.allowsMultipleSelection = false
+        } completion: { url in
             model.companionAudioURL = url
             model.log("已选择已有音频: \(url.lastPathComponent)")
         }
@@ -2373,10 +2681,10 @@ struct ContentView: View {
     }
 
     private func pickBGM() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.audio, .wav, .mpeg4Audio, .mp3]
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
+        presentOpenPanel { panel in
+            panel.allowedContentTypes = [.audio, .wav, .mpeg4Audio, .mp3]
+            panel.allowsMultipleSelection = false
+        } completion: { url in
             model.bgmURL = url
             model.log("已选择背景音乐: \(url.lastPathComponent)")
         }
@@ -2400,16 +2708,16 @@ struct ContentView: View {
     }
 
     private func pickFile() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [
-            .plainText,
-            .epub,
-            UTType(filenameExtension: "srt") ?? .text,
-            UTType(filenameExtension: "ass") ?? .text,
-            UTType(filenameExtension: "ssa") ?? .text,
-        ]
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
+        presentOpenPanel { panel in
+            panel.allowedContentTypes = [
+                .plainText,
+                .epub,
+                UTType(filenameExtension: "srt") ?? .text,
+                UTType(filenameExtension: "ass") ?? .text,
+                UTType(filenameExtension: "ssa") ?? .text,
+            ]
+            panel.allowsMultipleSelection = false
+        } completion: { url in
             Task { await model.loadInput(url: url) }
         }
     }
@@ -2430,12 +2738,23 @@ struct ContentView: View {
     private var progressSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("进度").font(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    Text("进度").font(.caption).foregroundStyle(.secondary)
+                    if model.isPaused {
+                        Text("已暂停")
+                            .font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1.5)
+                            .background(Color.orange.opacity(0.18))
+                            .foregroundStyle(.orange)
+                            .cornerRadius(4)
+                    }
+                }
                 Spacer()
                 Text(model.progressText).font(.caption.monospacedDigit())
             }
             ProgressView(value: model.progress)
-                .tint(.blue)
+                .tint(model.isPaused ? .orange : .blue)
         }
         .disabled(!model.isProcessing && model.progress == 0)
     }

@@ -659,6 +659,126 @@ enum SelfTest {
             }
             print("TRANSLATION CHECKPOINT OK: \(testBookURL.deletingPathExtension().lastPathComponent).translation.json（存档落盘·断点恢复·双语导出全流程验证通过）")
 
+            // 14b) 验证切碎子片段向前兼容贪婪拼接恢复（解决重载切分长句丢失的问题）
+            let fragmentedOrig = "Many cities did he visit, and many were the nations with whose manners and customs he was acquainted;"
+            let fragmentedMap = [
+                "Many cities did he visit,": "他到访过许多城市，",
+                "and many were the nations with whose manners and customs he was acquainted;": "他也熟悉众多民族的风俗习惯；"
+            ]
+            let testSubBookURL = dir.appendingPathComponent("selftest_sub.txt")
+            let subPayload: [String: Any] = [
+                "bookTitle": "selftest_sub",
+                "translations": fragmentedMap
+            ]
+            let subData = try JSONSerialization.data(withJSONObject: subPayload)
+            let subCpURL = Translator.getCheckpointURL(bookFileURL: testSubBookURL, bookTitle: "selftest_sub")
+            try subData.write(to: subCpURL)
+
+            let (restoredSub, subCount, _) = Translator.restoreFromCheckpoint(
+                sentences: [Sentence(id: 0, text: fragmentedOrig)],
+                bookFileURL: testSubBookURL,
+                bookTitle: "selftest_sub"
+            )
+            guard subCount == 1, restoredSub[0].translation != nil else {
+                throw BookStreamError.unsupportedFile("子片段贪婪拼接向前兼容恢复失败")
+            }
+            let restoredSubSplits = Translator.restoreSplitsFromCheckpoint(
+                sentences: [Sentence(id: 0, text: fragmentedOrig)],
+                bookFileURL: testSubBookURL,
+                bookTitle: "selftest_sub"
+            )
+            guard restoredSubSplits[fragmentedOrig] != nil else {
+                throw BookStreamError.unsupportedFile("子片段意群切分向前兼容恢复失败")
+            }
+
+            // 15) AI 意群双向对齐与无损切分安全自检验证
+            let origSentence = "Many cities did he visit, and many were the nations with whose manners and customs he was acquainted;"
+            let validEnSplit = "Many cities did he visit, ｜ and many were the nations with whose manners and customs he was acquainted;"
+            let validZhSplit = "他曾游历过许多城邦，｜结识了无数风土人情各异的部族；"
+            let splitRes = Translator.alignAndSplitSentence(originalText: origSentence, splitEn: validEnSplit, splitZh: validZhSplit, pauseAfter: 1.0)
+            guard let parts = splitRes, parts.count == 2,
+                  parts[0].text == "Many cities did he visit,",
+                  parts[0].translation == "他曾游历过许多城邦，",
+                  parts[0].pauseAfter == 0.4,
+                  parts[1].text == "and many were the nations with whose manners and customs he was acquainted;",
+                  parts[1].translation == "结识了无数风土人情各异的部族；",
+                  parts[1].pauseAfter == 1.0 else {
+                throw BookStreamError.unsupportedFile("AI 意群有效切分验证失败")
+            }
+
+            // 篡改单词/幻觉安全熔断测试（增加一个多余词 big，必须触发熔断保护，返回 nil）
+            let badEnSplit = "Many big cities did he visit, ｜ and many were the nations with whose manners and customs he was acquainted;"
+            guard Translator.alignAndSplitSentence(originalText: origSentence, splitEn: badEnSplit, splitZh: validZhSplit, pauseAfter: 1.0) == nil else {
+                throw BookStreamError.unsupportedFile("AI 意群篡改防范熔断失败")
+            }
+
+            // 语序重排错位熔断测试（中英文语序颠倒、边界相对位置差 >25pp，必须熔断返回 nil）
+            let reorderEn = "so she flew up to one of the rafters in the roof of the cloister ｜ and sat upon it in the form of a swallow."
+            let reorderZh = "于是她化作一只燕子，｜飞上回廊屋顶的一根椽木，栖息其上。"
+            guard Translator.alignAndSplitSentence(originalText: "so she flew up to one of the rafters in the roof of the cloister and sat upon it in the form of a swallow.", splitEn: reorderEn, splitZh: reorderZh, pauseAfter: 1.0) == nil else {
+                throw BookStreamError.unsupportedFile("AI 意群语序重排错位熔断失败")
+            }
+
+            // 畸形尾缀管道符熔断测试（「…，｜」尾缀空片段，必须熔断返回 nil）
+            let raggedZh = "当你在高龄与平静中安享晚年时，｜生命将悄然消逝，｜"
+            let raggedEn = "and your life shall ebb away very gently ｜ when you are full of years and peace of mind,"
+            guard Translator.alignAndSplitSentence(originalText: "and your life shall ebb away very gently when you are full of years and peace of mind,", splitEn: raggedEn, splitZh: raggedZh, pauseAfter: 1.0) == nil else {
+                throw BookStreamError.unsupportedFile("AI 意群畸形尾缀管道符熔断失败")
+            }
+            print("AI THOUGHT-GROUP ALIGNMENT OK: 双向自然对齐 · 0篡改0漏字 · 幻觉/错位/畸形分隔符全量熔断验证通过")
+
+            // 16) 暂停 / 继续控制器（PauseController）并发挂起与即时取消自检验证
+            let pauseCtrl = PauseController()
+            guard !pauseCtrl.isPaused else { throw BookStreamError.unsupportedFile("PauseController 初始状态错误") }
+            pauseCtrl.pause()
+            guard pauseCtrl.isPaused else { throw BookStreamError.unsupportedFile("PauseController pause 失败") }
+
+            // 验证异步暂停挂起与继续唤醒
+            let resumeTask = Task {
+                try await Task.sleep(nanoseconds: 50_000_000)
+                pauseCtrl.resume()
+            }
+            try await pauseCtrl.waitIfPaused()
+            _ = await resumeTask.result
+            guard !pauseCtrl.isPaused else { throw BookStreamError.unsupportedFile("PauseController resume 失败") }
+            guard pauseCtrl.totalPausedTime > 0 else { throw BookStreamError.unsupportedFile("PauseController 累计暂停时间统计失败") }
+
+            // 验证分阶段暂停时间隔离（避免前期暂停时长污染后续阶段）
+            let phase2Start = Date()
+            guard pauseCtrl.pausedTime(since: phase2Start) == 0 else {
+                throw BookStreamError.unsupportedFile("PauseController 阶段时长隔离校验失败")
+            }
+
+            // 验证暂停中收到取消信号毫秒级抛出异常退出
+            pauseCtrl.pause()
+            var didThrowCancelled = false
+            do {
+                try await pauseCtrl.waitIfPaused(cancellation: { true })
+            } catch BookStreamError.cancelled {
+                didThrowCancelled = true
+            }
+            guard didThrowCancelled else { throw BookStreamError.unsupportedFile("PauseController 暂停中取消响应失败") }
+            pauseCtrl.resume()
+            print("PAUSE/RESUME CONTROLLER OK: 并发挂起 · 零CPU等待 · 恢复唤醒 · 阶段时长隔离 · 毫秒级取消全流程验证通过")
+
+            // 17) 翻译设置旧存档向前兼容解码（新字段缺省时回退默认值，绝不重置用户设置）
+            let legacyJSON = """
+            {"enabled": true, "provider": "deepseek", "apiKey": "sk-legacy", "endpointURL": "https://api.deepseek.com", "model": "deepseek-chat"}
+            """
+            guard let legacyData = legacyJSON.data(using: .utf8) else { throw BookStreamError.unsupportedFile("设置解码数据构造失败") }
+            let legacySettings = try JSONDecoder().decode(TranslationSettings.self, from: legacyData)
+            guard legacySettings.enabled, legacySettings.provider == .deepseek,
+                  legacySettings.apiKey == "sk-legacy", legacySettings.model == "deepseek-chat",
+                  legacySettings.disableThinking, legacySettings.concurrentRequests == 4 else {
+                throw BookStreamError.unsupportedFile("旧存档设置向前兼容解码失败")
+            }
+            // 并发数钳制在 1...32
+            let clamped = TranslationSettings(concurrentRequests: 99)
+            guard clamped.concurrentRequests == 32, TranslationSettings(concurrentRequests: 0).concurrentRequests == 1 else {
+                throw BookStreamError.unsupportedFile("并发批数钳制失败")
+            }
+            print("SETTINGS BACKWARD-COMPAT OK: 旧存档解码回退默认值 · 并发批数 1~32 钳制 · 思考模式默认关闭")
+
             print("SELFTEST PASSED")
         } catch {
             print("SELFTEST FAILED: \(error)")

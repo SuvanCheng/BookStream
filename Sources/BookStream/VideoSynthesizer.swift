@@ -404,6 +404,7 @@ public final class VideoRenderer: @unchecked Sendable {
         watermark: WatermarkSettings = .default,
         fps: Int = 30,
         progress: @escaping @Sendable @MainActor (Double) -> Void,
+        pauseCheck: (@Sendable () throws -> Void)? = nil,
         cancellation: @escaping @Sendable () -> Bool
     ) async throws {
         try await withCheckedThrowingContinuation { continuation in
@@ -419,6 +420,7 @@ public final class VideoRenderer: @unchecked Sendable {
                         watermark: watermark,
                         fps: fps,
                         progress: progress,
+                        pauseCheck: pauseCheck,
                         cancellation: cancellation
                     )
                     continuation.resume()
@@ -441,6 +443,7 @@ public final class VideoRenderer: @unchecked Sendable {
         watermark: WatermarkSettings,
         fps: Int,
         progress: @escaping @Sendable @MainActor (Double) -> Void,
+        pauseCheck: (@Sendable () throws -> Void)? = nil,
         cancellation: @escaping @Sendable () -> Bool
     ) throws {
         // 应用所选分辨率与帧率（供内部帧合成使用）
@@ -578,6 +581,10 @@ public final class VideoRenderer: @unchecked Sendable {
 
         while videoIndex < totalVideoFrames || pendingAudio != nil || !audioDone {
             if cancellation() { throw BookStreamError.cancelled }
+            if let pause = pauseCheck {
+                try pause()
+                lastProgress = Date()
+            }
 
             let currentVideoTime = Double(videoIndex) / Double(fps)
 
